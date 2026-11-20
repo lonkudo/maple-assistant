@@ -16,6 +16,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -92,6 +93,12 @@ CARD_REPLY_WAIT_SECONDS = 30.0
 # while it shuts down.  The start waits this long for it to answer or exit instead
 # of launching a second instance that the vendor binary would refuse.
 STALE_SERVICE_GRACE_SECONDS = 8.0
+# Ownership record for the vendor service this install launched (see
+# _remember_ownership).  Kept under work\ so the log cleaner leaves it alone.
+OWNER_MARKER_NAME = "local-lie-owner.json"
+# How long a stop waits for the vendor process to really exit.  8765 must be free
+# before the next start, otherwise the new vendor is refused as a second instance.
+SERVICE_STOP_WAIT_SECONDS = 6.0
 
 # Re-entrant on purpose: several helpers take it (``has_online_card`` and
 # ``card_known`` read the state) and the failure paths of ``ensure_started`` call
@@ -101,6 +108,34 @@ STALE_SERVICE_GRACE_SECONDS = 8.0
 # 启动/没有任何反应" after one start that could not come up (no CT card, licence
 # refused, or a slow cold start).
 _lock = threading.RLock()
+
+# A reader on the Tk thread must never WAIT for a writer that is inside a long
+# operation.  ``_lock`` used to be held across the start sequence, and ``_probe``
+# (an HTTP health check with a 3 s timeout) ran inside it - so the poll's
+# ``hint_state()`` could block the whole UI: the window stopped pumping messages,
+# Windows declared it "not responding" while the header still read
+# 正在验证在线授权, and the next launch was refused as a duplicate (field report:
+# the restarted instance froze there, the second start flashed closed, the third
+# worked).  Reads therefore try the lock briefly and fall back to the last
+# published copy, which is at most one start-attempt old.
+STATE_READ_LOCK_TIMEOUT_SECONDS = 0.01
+_last_state_snapshot: dict[str, object] = {}
+
+
+def read_state() -> dict[str, object]:
+    """A copy of the service state that never blocks the calling thread."""
+
+    global _last_state_snapshot
+    if _lock.acquire(timeout=STATE_READ_LOCK_TIMEOUT_SECONDS):
+        try:
+            snapshot = dict(_state)
+            _last_state_snapshot = snapshot
+            return snapshot
+        finally:
+            _lock.release()
+    return dict(_last_state_snapshot)
+
+
 _state: dict[str, object] = {
     "state": "idle",       # idle | missing | starting | running | failed | external
     "note": "",
@@ -113,18 +148,32 @@ _state: dict[str, object] = {
 }
 
 
+# Seed the lock-free fallback so the first reader during a busy writer sees the
+# initial state instead of an empty dict.
+_last_state_snapshot = dict(_state)
+
+
 class LocalLieServiceError(RuntimeError):
     """The local service cannot be used or activated; the text is panel-ready."""
 
 
 def find_service_root(app_root: Path | str) -> Optional[Path]:
-    """The folder holding the packaged CT partner service, or None."""
+    """The folder holding the packaged CT partner service, or None.
+
+    The install root is NEVER a service folder.  ``BINARY_PATTERNS`` ends with
+    ``*.exe``, so the old third candidate made the app's own folder match as soon
+    as the vendor package was missing (``release_now.ps1`` does not ship it): the
+    "service binaries" then were ``MoonEclipse.exe`` itself, and a start attempt
+    launched a second copy of the assistant - the app vanished without a
+    traceback, which reads exactly like a flash close.  A candidate now has to hold
+    a vendor artefact: the package's own launcher, or an executable that is not
+    this app.
+    """
 
     root = Path(app_root)
     candidates = [
         root / SERVICE_FOLDER,
         root / SERVICE_FOLDER.parent,
-        root,
     ]
     for candidate in candidates:
         try:
@@ -359,17 +408,51 @@ def _log_vendor_reason(root: Path, prefix: str) -> str:
     return reason
 
 
+def _pid_is_service_binary(pid: int, image: str, root: Path, own: set[str],
+                           me: int) -> bool:
+    """Whether ``pid``/``image`` is a vendor process of ``root`` - never us.
+
+    Path verification is the whole point of this check: an image NAME is not
+    evidence (``python.exe``/``MoonEclipse.exe``/a same-named copy in another
+    folder all match one), and killing by name is how this feature could vanish
+    its own host process.
+    """
+
+    if int(pid) in (0, 4) or int(pid) == me:
+        return False
+    folded = str(image or "").casefold()
+    if not folded.endswith(".exe"):
+        return False
+    if not folded.startswith(str(root).casefold()):
+        return False
+    if Path(folded).name in own:
+        return False
+    return True
+
+
 def _service_pids(root: Path) -> list[int]:
-    """PIDs whose executable lives inside ``root`` (the service binaries)."""
+    """PIDs whose executable really lives inside ``root`` (path verified).
+
+    This program is never one of them (see ``_own_image_names``): a pid list that
+    contained the assistant made ``stop_started_service`` kill it, and the operator
+    saw a flash close the moment 本地测谎 was started.  When no privileged query is
+    available the sweep falls back to ``psutil`` (a product dependency) and still
+    verifies every executable path - it never resolves a pid by image name alone.
+    """
 
     pids: list[int] = []
+    own = _own_image_names()
+    me = os.getpid()
+    try:
+        wanted = Path(root).resolve()
+    except OSError:
+        wanted = Path(root)
     try:
         import win32api  # type: ignore[import-not-found]
         import win32process  # type: ignore[import-not-found]
 
-        wanted = str(root.resolve()).casefold()
         for pid in win32process.EnumProcesses():
-            if pid in (0, 4):
+            if int(pid) in (0, 4) or int(pid) == me:
                 continue
             handle = None
             try:
@@ -383,14 +466,24 @@ def _service_pids(root: Path) -> list[int]:
                         win32api.CloseHandle(handle)
                     except Exception:  # noqa: BLE001
                         pass
-            if path.casefold().startswith(wanted) and path.casefold().endswith(".exe"):
+            if _pid_is_service_binary(int(pid), path, wanted, own, me):
                 pids.append(int(pid))
-    except Exception:  # noqa: BLE001 - pywin32 missing: fall back to names
-        LOG.debug("local lie service: pid discovery unavailable", exc_info=True)
-        for name in _binary_names(root):
-            for pid in _pids_by_name(name):
-                if pid not in pids:
+    except Exception:  # noqa: BLE001 - pywin32 missing: use psutil paths
+        LOG.debug("local lie service: pywin32 pid query unavailable", exc_info=True)
+    if not pids:
+        try:
+            import psutil  # type: ignore[import-not-found]
+
+            for process in psutil.process_iter(["pid", "name"]):
+                try:
+                    image = str(process.exe() or "")
+                except Exception:  # noqa: BLE001 - a dead/denied pid has no path
+                    continue
+                pid = int(process.info.get("pid") or 0)
+                if _pid_is_service_binary(pid, image, wanted, own, me):
                     pids.append(pid)
+        except Exception:  # noqa: BLE001 - no psutil either: report nothing
+            LOG.debug("local lie service: psutil pid query unavailable", exc_info=True)
     return sorted(set(pids))
 
 
@@ -403,9 +496,32 @@ def _build_profile_exe_stem(root: Path) -> str:
     return str(profile.get("client_exe_stem") or "").strip()
 
 
-def _binary_names(root: Path) -> list[str]:
-    """Executables in the service folder, the package's declared one first."""
+def _own_image_names() -> set[str]:
+    """Image names that are THIS program, never the vendor service.
 
+    ``BINARY_PATTERNS`` ends with a bare ``*.exe``, so any folder sweep can pick
+    up the assistant itself (``MoonEclipse.exe`` in a frozen deployment, the
+    interpreter in a source one).  Treating it as a "service binary" is what let a
+    start attempt launch a second copy of the app, and what let a stop send a
+    SIGTERM to the app's own pid - both look like a flash close with no trace.
+    """
+
+    names = {"mooneclipse.exe", "todohelper.exe", "mapleassistant.exe",
+             "python.exe", "pythonw.exe"}
+    try:
+        names.add(Path(sys.executable).name.casefold())
+    except Exception:  # noqa: BLE001 - a missing sys.executable changes nothing
+        pass
+    return names
+
+
+def _binary_names(root: Path) -> list[str]:
+    """Executables in the service folder, the package's declared one first.
+
+    Never this program's own image (see ``_own_image_names``).
+    """
+
+    own = _own_image_names()
     names: list[str] = []
     stem = _build_profile_exe_stem(root)
     if stem and (root / f"{stem}.exe").is_file():
@@ -417,12 +533,21 @@ def _binary_names(root: Path) -> list[str]:
             continue
     ordered: list[str] = []
     for name in names:
+        if name.casefold() in own:
+            continue
         if name not in ordered:
             ordered.append(name)
     return ordered
 
 
 def _pids_by_name(image: str) -> list[int]:
+    """PIDs of every process with this IMAGE NAME (no path check).
+
+    Diagnostics only: a name is not proof of provenance, so nothing in this module
+    kills a process found this way (see ``_service_pids`` for the path-verified
+    variant used by starts and stops).
+    """
+
     try:
         completed = subprocess.run(
             ["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV", "/NH"],
@@ -579,7 +704,13 @@ def _credentials_rewritable_from_memory() -> bool:
 
 
 def _launch(root: Path) -> Optional[subprocess.Popen]:
-    """Start the packaged service hidden (WSH window style 0)."""
+    """Start the packaged service hidden (WSH window style 0).
+
+    The binaries come from ``_binary_names``, which already excludes this program's
+    own image: a folder sweep must never be able to start a second copy of the
+    assistant in place of the vendor service (that copy fought the first one for the
+    single-instance mutex and the operator saw the window disappear).
+    """
 
     for name in LAUNCHER_NAMES:
         launcher = root / name
@@ -664,52 +795,70 @@ def ensure_started(
     global _last_attempt_booting
     _last_attempt_booting = False
     root = find_service_root(app_root)
-    with _lock:
-        if root is None:
+    if root is None:
+        with _lock:
             _state.update(state="missing", note="未找到本地测谎服务目录",
                           root="", started_by_app=False, pids=[])
-            LOG.info("local lie service: the package folder is not installed "
-                     "next to this build, so 本地测谎 stays external")
-            return False, str(_state["note"])
-        running, note = _probe()
+        LOG.info("local lie service: the package folder is not installed "
+                 "next to this build, so 本地测谎 stays external")
+        return False, str(read_state().get("note") or "")
+    # Probe OUTSIDE the lock.  It is an HTTP health check with a 3 s timeout, and
+    # holding ``_lock`` across it blocked every reader on the Tk thread (see
+    # ``read_state``): the window stopped answering while the header still read
+    # 正在验证在线授权.
+    running, note = _probe()
+    with _lock:
         if running:
-            _state.update(state="external", note=note, root=str(root),
-                          started_by_app=False, pids=[], card_rejected=False)
-            LOG.info("local lie service: already running (%s)", note)
-            # The running instance already read its config at startup, so the
-            # plaintext copy is no longer needed - blank it unconditionally: no
-            # credential stays on disk, not even a stale one this session does not
-            # hold (memory is the only authority).
-            try:
-                scrub_service_credentials(app_root)
-            except Exception:  # noqa: BLE001 - a scrub must never block a start
-                LOG.debug("local lie service: credential scrub failed", exc_info=True)
-            return True, note
-        booting_pid = _launch_still_booting()
-        if booting_pid is not None:
-            # ONE launcher at a time.  Spawning a second vendor process while the
-            # first is still booting makes them collide on 8765 (the vendor binary
-            # is a single-instance service), so neither listens and the panel reads
-            # "本地测谎启动失败" until the operator restarts the app - the exact
-            # field report after a package update, whose first start is slow
-            # because Defender is still scanning the freshly copied 339 MB folder.
+            # Adopt a service THIS install launched in an earlier session: it is
+            # ours by provenance, so the app stops it again on exit instead of
+            # leaving an orphan that holds 8765 for ever ("the local lie service
+            # is not managed any more when I close the instance").  A service the
+            # operator started by hand has no marker and keeps running.
+            owned = _owned_by_us(root)
+            _state.update(state="running" if owned else "external", note=note,
+                          root=str(root), started_by_app=owned,
+                          pids=_service_pids(root) if owned else [],
+                          card_rejected=False)
+        else:
+            booting_pid = _launch_still_booting()
+            if booting_pid is None:
+                # A new launch is a new validation attempt.  A previous timeout or
+                # wrapper hand-off must not keep the panel at 启动失败 while this
+                # attempt is genuinely booting; a real new failure latches the flag
+                # again below.
+                _state.update(state="starting", note="正在启动本地测谎服务…",
+                              root=str(root), started_by_app=True, pids=[],
+                              card_rejected=False)
+    if running:
+        LOG.info("local lie service: already running (%s)", note)
+        # The running instance already read its config at startup, so the
+        # plaintext copy is no longer needed - blank it unconditionally: no
+        # credential stays on disk, not even a stale one this session does not
+        # hold (memory is the only authority).
+        try:
+            scrub_service_credentials(app_root)
+        except Exception:  # noqa: BLE001 - a scrub must never block a start
+            LOG.debug("local lie service: credential scrub failed", exc_info=True)
+        return True, note
+    if booting_pid is not None:
+        # ONE launcher at a time.  Spawning a second vendor process while the
+        # first is still booting makes them collide on 8765 (the vendor binary
+        # is a single-instance service), so neither listens and the panel reads
+        # "本地测谎启动失败" until the operator restarts the app - the exact
+        # field report after a package update, whose first start is slow
+        # because Defender is still scanning the freshly copied 339 MB folder.
+        with _lock:
             _state.update(
                 state="starting",
                 note="本地测谎服务正在启动（等待上一次启动完成）",
                 root=str(root), started_by_app=True, card_rejected=False,
             )
-            LOG.info(
-                "local lie service: launcher pid=%s is still booting; not starting "
-                "a second instance", booting_pid,
-            )
-            _last_attempt_booting = True
-            return False, str(_state["note"])
-        # A new launch is a new validation attempt.  A previous timeout or
-        # wrapper hand-off must not keep the panel at 启动失败 while this attempt
-        # is genuinely booting; a real new failure latches the flag again below.
-        _state.update(state="starting", note="正在启动本地测谎服务…",
-                      root=str(root), started_by_app=True, pids=[],
-                      card_rejected=False)
+        LOG.info(
+            "local lie service: launcher pid=%s is still booting; not starting "
+            "a second instance", booting_pid,
+        )
+        _last_attempt_booting = True
+        return False, str(read_state().get("note") or "")
     LOG.info("local lie service: starting %s", root)
     # A service process left over from the previous app run (a slow shutdown, or the
     # instance the update replaced) still holds 8765 for a moment.  Launching on top
@@ -997,10 +1146,10 @@ _selected_at = 0.0
 def _card_from_reply() -> str:
     """The CT card THIS session's licence reply delivered, or ""."""
 
-    with _lock:
-        if _state.get("card_denied"):
-            return ""
-        return str(_state.get("online_card") or "").strip()
+    state = read_state()
+    if state.get("card_denied"):
+        return ""
+    return str(state.get("online_card") or "").strip()
 
 
 _heartbeat_wait_logged = False
@@ -1173,6 +1322,61 @@ def _supervisor_job(root, interval: float) -> None:
         _supervisor_stop.wait(interval)
 
 
+def _owner_marker_path() -> Path:
+    return install_root() / "work" / OWNER_MARKER_NAME
+
+
+def _remember_ownership(root: Path) -> None:
+    """Record that THIS install launched the service, across restarts.
+
+    Without it, a service left behind by the previous run was found answering on
+    the next start, classified ``external`` (``started_by_app`` False), and from
+    then on the app never stopped it again - the operator's "when I close the
+    instance the local lie service is not managed any more".  The marker keeps the
+    ownership decision; a service the operator started by hand never gets one, so
+    it is still never killed.
+    """
+
+    try:
+        path = _owner_marker_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "root": str(root),
+                "started": time.time(),
+                "pids": _service_pids(root),
+            }, ensure_ascii=True),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001 - ownership bookkeeping is best effort
+        LOG.debug("local lie service: ownership marker could not be written",
+                  exc_info=True)
+
+
+def _release_ownership() -> None:
+    try:
+        _owner_marker_path().unlink(missing_ok=True)
+    except OSError:
+        LOG.debug("local lie service: ownership marker could not be removed",
+                  exc_info=True)
+
+
+def _owned_by_us(root: Path) -> bool:
+    """True when a service THIS install launched is still running."""
+
+    try:
+        data = json.loads(_owner_marker_path().read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - no marker means "not ours"
+        return False
+    try:
+        recorded = Path(str(data.get("root") or "")).resolve()
+        if os.path.normcase(str(recorded)) != os.path.normcase(str(root.resolve())):
+            return False
+    except OSError:
+        return False
+    return bool(_service_pids(root))
+
+
 def note_service_answering(note: str = "") -> None:
     """A probe proved 127.0.0.1:8765 answers: mark the service up.
 
@@ -1189,11 +1393,16 @@ def note_service_answering(note: str = "") -> None:
     with _lock:
         previous = str(_state.get("state") or "idle")
         started_by_app = bool(_state.get("started_by_app"))
+        root_text = str(_state.get("root") or "")
         _state.update(
             state="running" if started_by_app else "external",
             note=text,
             card_rejected=False,
         )
+    if started_by_app and root_text:
+        # A start THIS app performed: remember the ownership so the next run (and
+        # this run's shutdown) knows the service belongs to the app.
+        _remember_ownership(Path(root_text))
     if previous not in ("running", "external"):
         LOG.info(
             "local lie service: 8765 answers, so the service is up (%s -> %s)",
@@ -1237,10 +1446,10 @@ def current_card(app_root: Path | str | None = None) -> str:
        when no reply has arrived yet in this session.
     """
 
-    with _lock:
-        if _state.get("card_denied"):
-            return ""
-        card = str(_state.get("online_card") or "").strip()
+    state = read_state()
+    if state.get("card_denied"):
+        return ""
+    card = str(state.get("online_card") or "").strip()
     return card or config_card(app_root)
 
 
@@ -1261,9 +1470,10 @@ def card_known() -> bool:
     file itself, so a silent or cardless reply must not grey a working install.
     """
 
-    with _lock:
-        decided = bool(_state.get("card_checked"))
-    return decided or bool(config_card())
+    state = read_state()
+    if state.get("card_checked"):
+        return True
+    return bool(config_card())
 
 
 def note_card_absent() -> None:
@@ -1325,6 +1535,17 @@ def supervisor_set_active(active: bool, app_root=None) -> None:
         LOG.info("local lie service: pre-start disabled (selection left 本地测谎)")
         return
     root = Path(app_root) if app_root is not None else install_root()
+    # ``app_root`` is the ASSISTANT's folder (that is what every caller passes,
+    # including the CT-card path ``note_online_card``).  The state's ``root`` field
+    # is the SERVICE folder, because that is the value ``stop_started_service``
+    # verifies pids against - recording the assistant folder there made the stop
+    # look at the assistant's own executable.  Resolve it once, here.
+    service_root = find_service_root(root)
+    if service_root is None:
+        LOG.info(
+            "local lie service: no packaged service folder under %s, so 本地测谎 "
+            "stays external and nothing is ever started or stopped here", root,
+        )
     with _lock:
         newly_selected = not _desired_active
         _desired_active = True
@@ -1366,7 +1587,7 @@ def supervisor_set_active(active: bool, app_root=None) -> None:
                 if str(_state.get("state") or "idle") not in ("running", "external"):
                     _state.update(
                         state="waiting", note="等待授权信息（许可证心跳）",
-                        root=str(root), started_by_app=False,
+                        root=str(service_root or ""), started_by_app=False,
                     )
             _schedule_card_wait_expiry(root, CARD_REPLY_WAIT_SECONDS - waited + 1.0)
             return
@@ -1385,7 +1606,7 @@ def supervisor_set_active(active: bool, app_root=None) -> None:
         if not already_up:
             _state.update(
                 state="starting", note="正在启动本地测谎服务…",
-                root=str(root), started_by_app=True,
+                root=str(service_root or ""), started_by_app=service_root is not None,
             )
     if running:
         return
@@ -1497,40 +1718,77 @@ def start_in_background(
 
 
 def stop_started_service() -> int:
-    """Stop the service IF this app started it; returns how many were stopped."""
+    """Stop the service IF this app started it; returns how many were stopped.
+
+    Only PATH-VERIFIED processes are killed.  The old code preferred the pid list
+    recorded at launch, and those pids belong to the launcher script, which exits
+    immediately - a Windows pid can be reused within seconds, so
+    ``os.kill(recorded_pid)`` could terminate an unrelated process (a freshly
+    started instance of this very app is the worst case, and it looks exactly like
+    a flash close).  The stop now also WAITS for the vendor to really exit, so the
+    next start finds 8765 free.
+    """
 
     with _lock:
         started = bool(_state.get("started_by_app"))
         root_text = str(_state.get("root") or "")
-        known = [int(pid) for pid in (_state.get("pids") or [])]
     if not started or not root_text:
         LOG.info("local lie service: left running (this app did not start it)")
         return 0
     root = Path(root_text)
-    pids = known or _service_pids(root)
+    pids = _service_pids(root)
+    if not pids:
+        # Nothing was resolved, so nothing is killed.  The old fallback ran
+        # ``taskkill /F /PID`` for every process matching a BINARY NAME, and a
+        # folder that resolved to the install root made that name the app's own
+        # image: the assistant terminated itself with no traceback, no dump and no
+        # log line - the operator's flash close.  A pid is only ever killed when the
+        # path of its executable proves it lives in the service folder.
+        LOG.info(
+            "local lie service: no path-verified process of %s to stop; nothing "
+            "was killed", root,
+        )
+        _release_ownership()
+        with _lock:
+            _state.update(state="idle", note="本地测谎服务已随程序停止",
+                          started_by_app=False, pids=[])
+        return 0
     stopped = 0
+    me = os.getpid()
     for pid in pids:
+        if int(pid) == me:
+            # Belt and braces: _service_pids already excludes this process, and a
+            # SIGTERM here would end the app with no trace at all.
+            LOG.error("local lie service: refusing to stop pid %s (this process)", pid)
+            continue
         try:
             os.kill(pid, signal.SIGTERM)
             stopped += 1
         except OSError:
             LOG.debug("local lie service: pid %s already gone", pid)
-    if not pids:
-        for image in _binary_names(root):
-            for pid in _pids_by_name(image):
-                try:
-                    subprocess.run(
-                        ["taskkill", "/PID", str(pid), "/F"],
-                        capture_output=True, timeout=10,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    )
-                    stopped += 1
-                except (OSError, subprocess.SubprocessError):
-                    continue
+    # Wait for the exit: 8765 must be free before a new instance may start, and
+    # the vendor's own files must not be written under it.
+    deadline = time.monotonic() + SERVICE_STOP_WAIT_SECONDS
+    remaining = _service_pids(root)
+    while remaining and time.monotonic() < deadline:
+        time.sleep(PROBE_INTERVAL_SECONDS)
+        remaining = _service_pids(root)
+    if remaining:
+        LOG.warning(
+            "local lie service: %d process(es) of %s are still alive %.1fs after the "
+            "stop (pids=%s); the next start may be refused",
+            len(remaining), root, SERVICE_STOP_WAIT_SECONDS,
+            ", ".join(str(pid) for pid in remaining),
+        )
+    _release_ownership()
     with _lock:
         _state.update(state="idle", note="本地测谎服务已随程序停止",
                       started_by_app=False, pids=[])
-    LOG.info("local lie service: stopped %d process(es) with the app", stopped)
+    LOG.info(
+        "local lie service: stopped %d process(es) with the app (folder=%s, "
+        "pids=%s, this pid=%s)", stopped, root,
+        ", ".join(str(pid) for pid in pids) or "none", me,
+    )
     return stopped
 
 
@@ -2335,10 +2593,17 @@ def sync_product_key(product_key: str, app_root: Path | str | None = None) -> bo
     with _lock:
         started_by_app = bool(_state.get("started_by_app"))
     if started_by_app and not _busy():
+        # Hand the restart to the supervisor instead of running ``ensure_started``
+        # inline: this function is called from the licence-reply handler, and a
+        # cold start waits up to START_WAIT_SECONDS (90 s) - during which the
+        # header would still read 正在验证在线授权 while the Tk thread was blocked in
+        # ``hint_state`` on the same lock (field report: the restarted instance
+        # froze there).  The card path below has always been non-blocking; this
+        # one now matches it.
         LOG.info("local lie service: restarting so the refreshed key takes effect")
         stop_started_service()
         reset_for_tests()
-        ensure_started(root)
+        supervisor_set_active(True, root)
     return True
 
 
@@ -2534,11 +2799,11 @@ def hint_state() -> str:
     start on its card).
     """
 
-    with _lock:
-        state = str(_state.get("state") or "idle")
-        rejected = bool(_state.get("card_rejected"))
-        desired = _desired_active
-        denied = bool(_state.get("card_denied"))
+    state_snapshot = read_state()
+    state = str(state_snapshot.get("state") or "idle")
+    rejected = bool(state_snapshot.get("card_rejected"))
+    desired = _desired_active
+    denied = bool(state_snapshot.get("card_denied"))
     if not desired:
         return "off"
     if state in ("running", "external"):

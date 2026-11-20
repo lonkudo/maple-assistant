@@ -24,6 +24,7 @@ from typing import Any, Callable, Optional
 import numpy as np
 from PIL import Image, ImageDraw, ImageTk
 
+import instance_state
 from marker_detector import DiamondSizeTracker, detect_yellow_diamond
 from map_identity import MapIdentityStore
 from map_structure_tracker import MapStructureTracker
@@ -256,7 +257,15 @@ CIM_BOOT_RETRY_SECONDS = (3.0, 30.0, 60.0, 300.0)
 # application crashed").  After this long the pending state resolves as a
 # failure - the ↻ button and the next scheduled heartbeat keep trying in the
 # background - so the operator always gets an actionable screen back.
-LICENSE_PENDING_WATCHDOG_SECONDS = 75.0
+LICENSE_PENDING_WATCHDOG_SECONDS = 30.0
+# The LOCAL licence read (CIM/WMI device fingerprint + DPAPI) runs while the
+# dashboard is being built, before any window exists.  Right after an update or a
+# cold boot the CIM provider can take tens of seconds, which is what turned a
+# restart into "nothing happens for a minute" (and, with the old 75 s pending
+# watchdog, into a minute of 正在验证在线授权).  The read therefore gets this long
+# to answer; otherwise the panel starts on the online validation and the
+# heartbeat resolves it, exactly like a machine whose document is still pending.
+LICENSE_LOCAL_VERIFY_TIMEOUT_SECONDS = 8.0
 _GMT8 = timezone(timedelta(hours=8))
 
 # --- 更新图标 -----------------------------------------------------------------
@@ -1599,9 +1608,8 @@ class UiWorker(threading.Thread):
         # Fixed-rate attack worker (AttackWorker) the Fixed Attack panel
         # toggles: enabled flag, interval and attack key are applied live.
         self.attack_worker = attack_worker
-        # 随机休息 schedule: the panel only decides whether it is enabled (and in
-        # which attack modes); the worker owns the 75-120 min / 3-15 s timing and
-        # the movement+attack pause itself.
+        # Retained only to explicitly disable the retired 随机休息 worker when an
+        # old saved configuration is loaded.
         self.random_rest_worker = random_rest_worker
         # Independent Alt timer. It shares only the attack worker's runtime
         # gating events and exposes no configurable key binding.
@@ -1776,7 +1784,7 @@ class UiWorker(threading.Thread):
         # License verification is an independent boundary: it never changes
         # patrol/trade worker internals, it only decides whether UI actions may
         # enter those workflows.
-        local_license_status = verify_license()
+        local_license_status = self._bounded_local_license_verify()
         saved_equipment_id = self._load_saved_equipment_id()
         if saved_equipment_id:
             local_license_status = replace(
@@ -1965,7 +1973,11 @@ class UiWorker(threading.Thread):
             self._root = root
             self._ui_hang_watchdog = UiHangWatchdog(
                 application_root() / "work" / "ui_hang_trace.log",
-                timeout_seconds=8.0,
+                # Below Windows' own 5 s "not responding" test on purpose: the
+                # dump has to land BEFORE WER declares the window hung, otherwise
+                # the process dies first and a hang leaves no thread stacks at
+                # all (four AppHang reports in November had nothing to read).
+                timeout_seconds=3.5,
             )
             self._ui_hang_watchdog.start()
 
@@ -2551,9 +2563,7 @@ class UiWorker(threading.Thread):
                 variable=self._attack_mode_var,
                 command=self._fixed_on_mode_change,
             ).pack(side="left", padx=(8, 0))
-            # 随机休息 is created further down, inside the 延时回桩/跳反打 row: it is
-            # a mode-scoped optional modifier just like they are, and its interval
-            # is a hover tooltip rather than a permanent label on the panel.
+            # 定时休息 is created further down in the 延时回桩 modifier row.
             # These rows configure attacks only.  死花模式 still leaves the
             # mode selector and its 重置花 controls available, but must make
             # every normal attack option visibly unavailable.
@@ -2925,30 +2935,7 @@ class UiWorker(threading.Thread):
             jump_counterattack_hint.set_enabled(True)
             self._bind_key_tooltips.append(jump_counterattack_hint)
 
-            # 随机休息 shares this row, directly after 跳反打: like it, it is an
-            # optional modifier of the active mode (巡逻攻击 / 站桩攻击 /
-            # 双桩模式).  The panel greys it out everywhere else instead of hiding
-            # it, so the option stays discoverable without changing the panel
-            # geometry.  The 75m~120m / 3s~15s schedule is a hover hint, not a
-            # permanent label, so the row stays one line wide.
-            self._random_rest_var = tk.BooleanVar(value=False)
-            self._random_rest_check = ttk.Checkbutton(
-                delayed_return_row,
-                text="随机休息",
-                width=7,
-                variable=self._random_rest_var,
-                command=self._fixed_on_change,
-            )
-            self._random_rest_check.pack(side="left", padx=(8, 0))
-            random_rest_hint = HoverTooltip(
-                self._random_rest_check,
-                "每75m~120m 休息3s~15s",
-            )
-            random_rest_hint.set_enabled(True)
-            self._random_rest_hint = random_rest_hint
-            self._bind_key_tooltips.append(random_rest_hint)
-
-            # 范围桩 shares this row immediately after 延时回桩.  Unlike 随机休息
+            # 范围桩 shares this row immediately after 延时回桩.  Unlike 定时休息
             # it only means something on a 桩, so its own gate is 站桩攻击 /
             # 双桩模式 (the row is greyed, never hidden, elsewhere).
             self._blurred_anchor_var = tk.BooleanVar(value=False)
@@ -2968,15 +2955,52 @@ class UiWorker(threading.Thread):
             self._blurred_anchor_hint = blurred_anchor_hint
             self._bind_key_tooltips.append(blurred_anchor_hint)
 
-            # Keep all four optional return modifiers on one stable row.  Their
-            # construction order follows their dependencies, but their visual
-            # order is intentionally: 延时回桩 → 范围桩 → 跳反打 → 随机休息.
+            # 定时休息 replaces the retired 随机休息 in this stable modifier row.
+            # Visual order: 延时回桩 → 范围桩 → 跳反打 → 定时休息.
+            self._timed_rest_enabled_var = tk.BooleanVar(value=False)
+            timed_rest_enabled = ttk.Checkbutton(
+                delayed_return_row, text="定时休息", width=8,
+                variable=self._timed_rest_enabled_var,
+                command=self._fixed_on_change,
+            )
+            timed_rest_every_label = ttk.Label(delayed_return_row, text="每")
+            timed_rest_debug = self._pickup_debug_mode()
+            timed_rest_step = 1.0 / 60.0 if timed_rest_debug else 1.0
+            timed_rest_lower = 1.0 / 60.0 if timed_rest_debug else 1.0
+            self._timed_rest_interval_control = NumericValueRangeControl(
+                delayed_return_row, tk_module=tk, ttk_module=ttk,
+                minimum=60, range_mode=False, value_type=float, step=timed_rest_step,
+                lower_bound=timed_rest_lower, upper_bound=1440, unit="m", value_width=5,
+                before_change=lambda: self._undo_capture_callback("定时休息间隔"),
+                on_change=self._fixed_on_change,
+                formatter=(self._format_stationary_pickup_interval
+                           if timed_rest_debug else None),
+            )
+            self._timed_rest_duration_control = NumericValueRangeControl(
+                delayed_return_row, tk_module=tk, ttk_module=ttk,
+                minimum=5, range_mode=False, value_type=float, step=timed_rest_step,
+                lower_bound=timed_rest_lower, upper_bound=1440, unit="m", value_width=5,
+                before_change=lambda: self._undo_capture_callback("定时休息时长"),
+                on_change=self._fixed_on_change,
+                formatter=(self._format_stationary_pickup_interval
+                           if timed_rest_debug else None),
+            )
+            timed_rest_duration_label = ttk.Label(delayed_return_row, text="休息")
+            self._timed_rest_controls = [
+                timed_rest_enabled,
+                self._timed_rest_interval_control.min_label,
+                self._timed_rest_duration_control.min_label,
+            ]
+
             jump_counterattack_button.pack_forget()
-            self._random_rest_check.pack_forget()
             self._blurred_anchor_check.pack_forget()
             self._blurred_anchor_check.pack(side="left", padx=(8, 0))
             jump_counterattack_button.pack(side="left", padx=(8, 0))
-            self._random_rest_check.pack(side="left", padx=(8, 0))
+            timed_rest_enabled.pack(side="left", padx=(8, 0))
+            timed_rest_every_label.pack(side="left")
+            self._timed_rest_interval_control.pack(side="left", padx=(1, 3))
+            timed_rest_duration_label.pack(side="left")
+            self._timed_rest_duration_control.pack(side="left", padx=(1, 0))
 
             step_row = ttk.Frame(stationary_options_row)
             self._small_step_options_row = step_row
@@ -3475,6 +3499,21 @@ class UiWorker(threading.Thread):
             )
             abnormal_hint.set_enabled(True)
             self._bind_key_tooltips.append(abnormal_hint)
+
+            self._empty_attack_alert_var = tk.BooleanVar(value=False)
+            empty_attack_check = ttk.Checkbutton(
+                alarm_row,
+                text="空打",
+                variable=self._empty_attack_alert_var,
+                command=self._shutdown_on_change,
+            )
+            empty_attack_check.pack(side="left", padx=(0, 6))
+            empty_attack_hint = HoverTooltip(
+                empty_attack_check,
+                "如果30s没有exp增长，就停止攻击",
+            )
+            empty_attack_hint.set_enabled(True)
+            self._bind_key_tooltips.append(empty_attack_hint)
 
             self._countdown_enabled_var = tk.BooleanVar(value=False)
             self._countdown_check = ttk.Checkbutton(
@@ -5978,6 +6017,12 @@ class UiWorker(threading.Thread):
     def _poll_body(self, root: Any) -> None:
         """One tick's work, without the re-arm (see :meth:`_poll`)."""
 
+        # Liveness for the silent single-instance guard: a poll that stops here
+        # (a native modal dialog stops this whole loop) makes the beat stale, and
+        # that is the only way a fresh launch can tell a healthy owner from a
+        # copy whose window is unreachable behind the game.  One os.utime every
+        # couple of seconds; nothing is displayed and nothing is logged.
+        instance_state.touch_beat()
         # The physical hotkey stop is an emergency path.  Its hook has already
         # disarmed game input, so let Tk show that fact before draining any
         # routine result queue.  In particular, a slow channel/configuration
@@ -6378,6 +6423,42 @@ class UiWorker(threading.Thread):
         self._refresh_license_ui()
         self._begin_license_refresh_cooldown(button)
 
+    def _bounded_local_license_verify(self) -> LicenseStatus:
+        """``verify_license()`` with a deadline, so a slow CIM cannot stall boot.
+
+        The call reads the signed document, then the machine fingerprint through
+        CIM/WMI (``machine_fingerprint_components``) plus DPAPI.  That is normally
+        instant and cached, but right after an update - Defender scanning the
+        freshly copied folder, the WMI provider waking up - it has been observed
+        taking tens of seconds, and it blocks the thread that is building the
+        dashboard.  Waiting for ``LICENSE_LOCAL_VERIFY_TIMEOUT_SECONDS`` and then
+        starting on the online validation keeps the same semantics as a machine
+        whose local document is not conclusive yet: the heartbeat decides.
+        """
+
+        result: list[LicenseStatus] = []
+        done = threading.Event()
+
+        def job() -> None:
+            try:
+                result.append(verify_license())
+            except Exception:  # noqa: BLE001 - the caller has a fallback
+                LOG.warning("local licence verification failed", exc_info=True)
+            finally:
+                done.set()
+
+        threading.Thread(
+            target=job, name="license-local-verify", daemon=True,
+        ).start()
+        if done.wait(LICENSE_LOCAL_VERIFY_TIMEOUT_SECONDS) and result:
+            return result[0]
+        LOG.warning(
+            "local licence verification did not answer within %.0fs "
+            "(CIM/DPAPI slow); starting on the online validation",
+            LICENSE_LOCAL_VERIFY_TIMEOUT_SECONDS,
+        )
+        return LicenseStatus(False, "checking", "正在验证在线授权…")
+
     def _arm_license_pending(self) -> None:
         """Mark the online check pending and arm its watchdog.
 
@@ -6588,7 +6669,6 @@ class UiWorker(threading.Thread):
         if latest is None:
             return
         self._device_unbind_in_flight = False
-        root = getattr(self, "_root", None)
         if latest.valid and latest.code == "unbound":
             # Copy first: the newly unbound code is what the customer needs on
             # the replacement computer.  The local signed document is then
@@ -6610,26 +6690,17 @@ class UiWorker(threading.Thread):
             self._lock_licensed_functions()
             if hasattr(self, "_control_status"):
                 self._control_status.configure(text="解绑成功，授权码已复制，本机功能已锁定。")
-            try:
-                from tkinter import messagebox
-                if root is not None:
-                    messagebox.showinfo(
-                        "解绑成功",
-                        "解绑成功，授权码已复制。\n\n请在新设备激活授权；本机功能已锁定。",
-                        parent=root,
-                    )
-            except Exception:
-                LOG.debug("device self-unbind success dialog could not open", exc_info=True)
+            # No modal dialog here.  This drain runs inside the UI poll, and a
+            # tk_messageBox blocks that whole poll with its own native message
+            # loop: Tk stops drawing, Windows declares the window hung after
+            # five seconds (WER AppHangB1), and the dialog itself often ends up
+            # behind the game - an instance that "flashed closed" while it was
+            # still alive and holding the single-instance mutex.  The status line
+            # above already says what happened; the log keeps the record.
             LOG.info("device self-unbind accepted; local automation locked")
             return
         if hasattr(self, "_control_status"):
             self._control_status.configure(text=f"解绑失败：{latest.message}")
-        try:
-            from tkinter import messagebox
-            if root is not None:
-                messagebox.showerror("解绑失败", latest.message, parent=root)
-        except Exception:
-            LOG.debug("device self-unbind failure dialog could not open", exc_info=True)
         LOG.warning("device self-unbind rejected: %s", latest.code)
 
     def _drain_lie_accounting_results(self) -> None:
@@ -7811,6 +7882,8 @@ class UiWorker(threading.Thread):
                     self._play_action_sound(self._record_split_point())
                 elif action == "record_flower_point":
                     self._play_action_sound(self._record_flower_point())
+                elif action == "record_rest_point":
+                    self._play_action_sound(self._record_rest_point())
                 elif action == "record_support_point":
                     self._play_action_sound(self._record_support_point())
                 elif action.startswith("record_dual_stationary_post:"):
@@ -8555,14 +8628,12 @@ class UiWorker(threading.Thread):
         except Exception:  # noqa: BLE001
             LOG.debug("panel hint refresh failed", exc_info=True)
         body = f"{text}\n\n详情已记录到运行日志。"
-        try:
-            from tkinter import messagebox
-
-            messagebox.showerror(
-                "测试本地测谎", body, parent=getattr(self, "_root", None)
-            )
-        except Exception:  # noqa: BLE001 - no window to attach to
-            LOG.info("试跑: %s", body)
+        # Deliberately silent: a modal box opened from the UI poll freezes the
+        # whole tick (native message loop) and, when the operator is in the game,
+        # it lands behind the window - the instance then looks dead while it still
+        # owns the single-instance mutex.  The status line above plus this log
+        # line carry the same information.
+        LOG.info("试跑: %s", body)
 
     def _drain_api_test_results(self) -> None:
         """Show the 试跑 drill's progress on Tk's owning thread.
@@ -9040,17 +9111,10 @@ class UiWorker(threading.Thread):
                 self._api_auto_lie_var.set(True)
                 self._api_auto_lie_backend_changed()
             self._refresh_panel_hints()
-            try:
-                from tkinter import messagebox
-
-                show = messagebox.showinfo if ok else messagebox.showerror
-                show(
-                    "激活测谎",
-                    ("本地测谎已激活：" + note) if ok else str(note),
-                    parent=getattr(self, "_root", None),
-                )
-            except Exception:  # noqa: BLE001 - no window to attach to
-                LOG.info("激活测谎: %s", note)
+            # Silent result: the panel hints above already show the outcome, and
+            # a modal box from inside the poll tick freezes the UI (see
+            # _drain_device_unbind_results) - it must never be the reason a
+            # window is declared hung while the mutex stays owned.
             return
         if not self._auto_lie_backend_is_local():
             return
@@ -11645,6 +11709,32 @@ class UiWorker(threading.Thread):
         self._refresh_patrol_controls()
         return True
 
+    def _record_rest_point(self) -> bool:
+        """Record the timed-rest waypoint (Ctrl+H) from the live marker."""
+
+        if self.patrol_controller is None or self.patrol_controller.is_enabled():
+            self._control_status.configure(text="巡逻中无法录制休点，请先停止巡逻。")
+            return False
+        snapshot = self._capture_snapshot_for_recording()
+        if snapshot is None or snapshot.player_x is None or snapshot.player_y is None:
+            self._control_status.configure(text="无法录制休点：未检测到黄色菱形标记。")
+            return False
+        try:
+            undo_saved = self._undo_capture("录制休点")
+            point = self.patrol_controller.record_rest_point(
+                snapshot.player_x, snapshot.player_y, snapshot.coordinate_layout,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            if undo_saved:
+                self._undo_discard_latest("录制休点")
+            self._control_status.configure(text=f"无法录制休点: {exc}")
+            return False
+        self._control_status.configure(
+            text=f"已录制 {point.layer} 休点：X={point.x:.6f}，Y={point.y:.6f}。"
+        )
+        self._refresh_patrol_controls()
+        return True
+
     def _record_support_point(self) -> bool:
         """Record a local layer supporter without adding a route action."""
 
@@ -11804,12 +11894,13 @@ class UiWorker(threading.Thread):
             ("添加右跳", "jump_point", lambda: self._record_jump_point("right")),
             ("添加上跳", "jump_point", lambda: self._record_jump_point("up")),
             ("添加花点", "flower_point", self._record_flower_point),
+            ("添加休点", "rest_point", self._record_rest_point),
             ("添加支持点", "support_point", self._record_support_point),
         )
         final_name = self.patrol_controller.final_layer_name()
         for label, kind, command in entries:
             already_recorded = (
-                kind not in ("jump_point", "flower_point", "support_point")
+                kind not in ("jump_point", "flower_point", "rest_point", "support_point")
                 and self.patrol_controller.endpoint(layer_name, kind) is not None
             )
             unavailable_rope = kind == "rope_pos" and layer_name == final_name
@@ -11993,6 +12084,11 @@ class UiWorker(threading.Thread):
                         # labels instead of making the second marker look
                         # like a replacement for the first one.
                         entries.append(("flower_point", point, f"花{index + 1}", index))
+            rest_points = source.get("rest_points", [])
+            if isinstance(rest_points, list):
+                for index, point in enumerate(rest_points):
+                    if isinstance(point, dict) and "x" in point and "y" in point:
+                        entries.append(("rest_point", point, "休", index))
             support_points = source.get("support_points", [])
             if isinstance(support_points, list):
                 base_ys = []
@@ -12050,6 +12146,9 @@ class UiWorker(threading.Thread):
             "jump_point": "#1d9b45",
             "skill_point": "#8a2be2",
             "flower_point": "#d13a8b",
+            # 休 is a destination waypoint, rendered with the same pink
+            # circular grammar as 花 rather than as a directional jump mark.
+            "rest_point": "#d13a8b",
             "support_point": "#4a6f9c",
             "dual_stationary_post": "#cc2222",
         }
@@ -12090,10 +12189,12 @@ class UiWorker(threading.Thread):
                     text=self._skill_key_axis_label(point.get("key", "")),
                     fill="white", font=("TkDefaultFont", 10, "bold"), tags=(tag,),
                 )
-            elif kind == "flower_point":
+            elif kind in ("flower_point", "rest_point"):
                 # Two flower points may share one rope X.  The later marker
                 # intentionally reads 花2 at that same X, while each marker's
-                # own hover text still supplies its distinct recorded Y.
+                # own hover text still supplies its distinct recorded Y.  A 休
+                # point is likewise a location, not an action direction, so it
+                # deliberately shares the pink circular marker and centered text.
                 canvas.create_oval(
                     x - 8, axis_y - 16, x + 8, axis_y - 2,
                     fill=colors[kind], outline="", tags=(tag,),
@@ -12264,13 +12365,6 @@ class UiWorker(threading.Thread):
         interval_min, interval_max = self._fixed_attack_range()
         return {
             "attack_mode": str(self._attack_mode_var.get()),
-            # 随机休息 is a mode-scoped option (巡逻攻击 / 站桩攻击 / 双桩模式); the
-            # saved flag is kept even when another mode greys it out, so switching
-            # back restores the operator's choice.
-            "random_rest_enabled": bool(
-                self._random_rest_var.get()
-                if hasattr(self, "_random_rest_var") else False
-            ),
             # 模糊桩: a wider 桩 zone with an offset return target (站桩/双桩 only).
             "blurred_anchor_enabled": bool(
                 self._blurred_anchor_var.get()
@@ -12327,6 +12421,16 @@ class UiWorker(threading.Thread):
                 getattr(self, "_stationary_delayed_return_enabled_var", None).get()
                 if hasattr(self, "_stationary_delayed_return_enabled_var") else False
             ),
+            "timed_rest_enabled": bool(
+                getattr(self, "_timed_rest_enabled_var", None).get()
+                if hasattr(self, "_timed_rest_enabled_var") else False
+            ),
+            "timed_rest_interval_minutes": float(
+                self._timed_rest_interval_control.get_bounds()[0]
+            ) if hasattr(self, "_timed_rest_interval_control") else 60,
+            "timed_rest_duration_minutes": float(
+                self._timed_rest_duration_control.get_bounds()[0]
+            ) if hasattr(self, "_timed_rest_duration_control") else 5,
             "dual_stationary_posts": self._dual_stationary_posts_data(),
             "dual_stationary_switch_min_minutes": self._dual_stationary_switch_range_minutes()[0],
             "dual_stationary_switch_max_minutes": self._dual_stationary_switch_range_minutes()[1],
@@ -12792,25 +12896,13 @@ class UiWorker(threading.Thread):
         dual_stationary_enabled = mode == "dual_stationary" and self._license_allowed()
         flower_cycle_enabled = mode in ("fixed", "stationary", "dual_stationary", "dead_flower") and self._license_allowed()
         dead_flower_mode = mode == "dead_flower"
-        # 随机休息 only exists where the character patrols or stands on a 桩.  It
-        # shares a row with 延时回桩/跳反打, so only the checkbox is gated - the
-        # row's other controls keep their own rules.
-        rest_allowed = (
-            mode in ("fixed", "stationary", "dual_stationary")
-            and self._license_allowed()
-        )
-        rest_check = getattr(self, "_random_rest_check", None)
-        if rest_check is not None:
-            try:
-                rest_check.state(["!disabled" if rest_allowed else "disabled"])
-            except Exception:
-                rest_check.configure(state="normal" if rest_allowed else "disabled")
+        # 随机休息 was retired in favour of 定时休息.  Explicitly disarm its
+        # legacy worker so an old user_config flag can never revive it.
         rest_worker = getattr(self, "random_rest_worker", None)
-        rest_var = getattr(self, "_random_rest_var", None)
-        if rest_worker is not None and rest_var is not None:
+        if rest_worker is not None:
             rest_setter = getattr(rest_worker, "set_enabled", None)
             if callable(rest_setter):
-                rest_setter(bool(rest_var.get()) and rest_allowed)
+                rest_setter(False)
         # 模糊桩 exists only on a 桩 (站桩攻击 / 双桩模式): anywhere else it is greyed
         # and the movement worker is told to disable it, so a mode change can
         # never leave a wider 桩 zone armed.
@@ -12929,6 +13021,12 @@ class UiWorker(threading.Thread):
             small_step_row.pack(side="left", padx=(4, 0))
         if delayed_return_row is not None and not delayed_return_row.winfo_manager():
             delayed_return_row.pack(fill="x", pady=(2, 0))
+        timed_rest_allowed = mode in ("fixed", "stationary", "dual_stationary") and self._license_allowed()
+        for widget in getattr(self, "_timed_rest_controls", []):
+            try:
+                widget.state(["!disabled" if timed_rest_allowed else "disabled"])
+            except Exception:
+                widget.configure(state="normal" if timed_rest_allowed else "disabled")
         if stationary_facing_row is not None:
             stationary_facing_row.pack_forget()
         if dual_row is not None:
@@ -13008,6 +13106,8 @@ class UiWorker(threading.Thread):
             "_small_step_control",
             "_small_step_post_attack_control",
             "_stationary_pickup_control",
+            "_timed_rest_interval_control",
+            "_timed_rest_duration_control",
             "_dual_stationary_switch_control",
         ):
             control = getattr(self, control_name, None)
@@ -13309,6 +13409,14 @@ class UiWorker(threading.Thread):
                     pickup_min * 60.0,
                     max(0.0, pickup_max - pickup_min) * 60.0,
                 )
+            timed_rest_setter = getattr(mover, "set_timed_rest_schedule", None)
+            if callable(timed_rest_setter):
+                timed_rest_setter(
+                    bool(data.get("timed_rest_enabled", False))
+                    and mode in ("fixed", "stationary", "dual_stationary"),
+                    max(1.0 / 60.0, float(data.get("timed_rest_interval_minutes", 60))) * 60.0,
+                    max(1.0 / 60.0, float(data.get("timed_rest_duration_minutes", 5))) * 60.0,
+                )
 
     def _fixed_refresh_grey(self) -> None:
         """Grey the YOLO panel + update status lines for the active mode."""
@@ -13436,10 +13544,6 @@ class UiWorker(threading.Thread):
             if not self._YOLO_MONSTER_DETECTION_ENABLED:
                 if self._attack_mode_var.get() not in ("fixed", "flower_patrol", "stationary", "dual_stationary", "dead_flower"):
                     self._attack_mode_var.set("fixed")
-            # 随机休息: restore the saved choice; the mode rules decide afterwards
-            # whether it is actually in effect (``_fixed_refresh_rows``).
-            if hasattr(self, "_random_rest_var"):
-                self._random_rest_var.set(bool(data.get("random_rest_enabled", False)))
             # 模糊桩 travels the same way: the saved tick is kept even while the
             # row is greyed, so switching back to 站桩 restores the operator's
             # choice.
@@ -13555,6 +13659,20 @@ class UiWorker(threading.Thread):
                     and hasattr(self, "_stationary_delayed_return_enabled_var")):
                 self._stationary_delayed_return_enabled_var.set(bool(
                     data["stationary_delayed_return_enabled"]
+                ))
+            if "timed_rest_enabled" in data and hasattr(self, "_timed_rest_enabled_var"):
+                self._timed_rest_enabled_var.set(bool(data["timed_rest_enabled"]))
+            timed_rest_interval = getattr(self, "_timed_rest_interval_control", None)
+            if timed_rest_interval is not None:
+                timed_rest_interval.set_bounds(max(
+                    1.0 / 60.0 if self._pickup_debug_mode() else 1.0,
+                    float(data.get("timed_rest_interval_minutes", 60)),
+                ))
+            timed_rest_duration = getattr(self, "_timed_rest_duration_control", None)
+            if timed_rest_duration is not None:
+                timed_rest_duration.set_bounds(max(
+                    1.0 / 60.0 if self._pickup_debug_mode() else 1.0,
+                    float(data.get("timed_rest_duration_minutes", 5)),
                 ))
             pickup_control = getattr(self, "_stationary_pickup_control", None)
             if pickup_control is not None:
@@ -13883,6 +14001,10 @@ class UiWorker(threading.Thread):
         if hasattr(self, "_disconnect_alert_var"):
             data["disconnect_alert_enabled"] = bool(
                 self._disconnect_alert_var.get()
+            )
+        if hasattr(self, "_empty_attack_alert_var"):
+            data["empty_attack_alert_enabled"] = bool(
+                self._empty_attack_alert_var.get()
             )
         if hasattr(self, "_lie_alert_var"):
             data["lie_alert_enabled"] = bool(self._lie_alert_var.get())
@@ -14633,6 +14755,7 @@ class UiWorker(threading.Thread):
                 "shutdown_enabled": False,
                 "player_check_enabled": False,
                 "disconnect_alert_enabled": False,
+                "empty_attack_alert_enabled": False,
                 "lie_alert_enabled": False,
                 "abnormal_alert_enabled": False,
                 "auto_lie_api_enabled": False,
@@ -14750,6 +14873,11 @@ class UiWorker(threading.Thread):
             setter = getattr(abnormal_notifier, "set_enabled", None)
             if setter is not None:
                 setter(bool(data.get("abnormal_alert_enabled", False)))
+        status_worker = getattr(self, "status_worker", None)
+        if status_worker is not None:
+            setter = getattr(status_worker, "set_exp_stall_monitor", None)
+            if callable(setter):
+                setter(bool(data.get("empty_attack_alert_enabled", False)))
         blinker = getattr(self, "screen_blinker", None)
         if blinker is not None:
             setter = getattr(blinker, "set_enabled", None)
@@ -15093,7 +15221,7 @@ class UiWorker(threading.Thread):
         "left": "←", "right": "→", "up": "↑", "down": "↓",
         "home": "Home", "end": "End", "insert": "Insert", "delete": "Delete",
         "bracketleft": "[", "bracketright": "]", "grave": "`",
-        "a": "A", "d": "D", "e": "E", "f": "F", "s": "S", "g": "G",
+        "a": "A", "d": "D", "e": "E", "f": "F", "g": "G", "h": "H", "s": "S",
         "0": "0", "1": "1", "2": "2", "3": "3", "4": "4",
         "5": "5", "6": "6", "7": "7", "8": "8", "9": "9",
     }
@@ -15107,6 +15235,7 @@ class UiWorker(threading.Thread):
         "record_jump_point:up": "添入当前图层的上跳点 (Ctrl+End)",
         "record_split_point": "在当前位置添加贯穿全部楼层的波浪分区线 (Ctrl+S)",
         "record_flower_point": "录制当前绳索层的花点 (Ctrl+G)",
+        "record_rest_point": "录制当前图层的休点 (Ctrl+H)",
         "record_support_point": "录制当前图层的局部支持点 (Ctrl+A)",
         "record_dual_stationary_post:first": "录制桩1；随后按 D=朝左、F=朝右、G=双向 (Ctrl+R)",
         "record_dual_stationary_post:second": "录制桩2；随后按 D=朝左、F=朝右、G=双向 (Ctrl+T)",
@@ -15614,6 +15743,10 @@ class UiWorker(threading.Thread):
                 self, "_lie_alert_var"
             ):
                 self._lie_alert_var.set(bool(data["lie_alert_enabled"]))
+            if hasattr(self, "_empty_attack_alert_var"):
+                self._empty_attack_alert_var.set(bool(
+                    data.get("empty_attack_alert_enabled", False)
+                ))
             if hasattr(self, "_abnormal_alert_var"):
                 self._abnormal_alert_var.set(bool(
                     data.get("abnormal_alert_enabled", False)
@@ -16259,6 +16392,12 @@ class UiWorker(threading.Thread):
             and getattr(self, "_stationary_pickup_enabled_var", None) is not None
             and self._stationary_pickup_enabled_var.get()
         )
+        timed_rest_selected = bool(
+            mode_var is not None
+            and str(mode_var.get()) in ("fixed", "stationary", "dual_stationary")
+            and getattr(self, "_timed_rest_enabled_var", None) is not None
+            and self._timed_rest_enabled_var.get()
+        )
         if (mode_var is not None and str(mode_var.get()) == "dual_stationary"
                 and len(self._dual_stationary_posts_data()) != 2):
             self._control_status.configure(
@@ -16268,9 +16407,11 @@ class UiWorker(threading.Thread):
         try:
             route_ready = self.patrol_controller.can_start(
                 allow_flower_only_layers=wait_dead_flower_selected,
+                allow_rest_only_layers=timed_rest_selected,
             )
             route_errors = self.patrol_controller.validate_patrol_route(
                 allow_flower_only_layers=wait_dead_flower_selected,
+                allow_rest_only_layers=timed_rest_selected,
             )
         except TypeError:
             # Compatibility for lightweight integrations which expose only
@@ -16287,8 +16428,8 @@ class UiWorker(threading.Thread):
                 sorted(self.patrol_controller.snapshot_layers()),
             )
             self._control_status.configure(
-                text=(("无法开始: 等死花之外的巡逻层都需要最左和最右点。"
-                       if wait_dead_flower_selected
+                text=(("无法开始: 等死花/定时休息之外的巡逻层都需要最左和最右点。"
+                       if wait_dead_flower_selected or timed_rest_selected
                        else "无法开始: 巡逻路线的每层都需要最左和最右点。")
                       + (" " + "；".join(route_errors) if route_errors else ""))
             )
@@ -16674,9 +16815,15 @@ class UiWorker(threading.Thread):
             and getattr(self, "_stationary_pickup_enabled_var", None) is not None
             and self._stationary_pickup_enabled_var.get()
         )
+        timed_rest_selected = bool(
+            mode_value in ("fixed", "stationary", "dual_stationary")
+            and getattr(self, "_timed_rest_enabled_var", None) is not None
+            and self._timed_rest_enabled_var.get()
+        )
         try:
             route_can_start = self.patrol_controller.can_start(
                 allow_flower_only_layers=wait_dead_flower_selected,
+                allow_rest_only_layers=timed_rest_selected,
             )
         except TypeError:
             route_can_start = self.patrol_controller.can_start()

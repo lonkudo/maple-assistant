@@ -2201,6 +2201,7 @@ class StatusWorker(threading.Thread):
         charge_active_callback: Any = None,
         charge_interrupt_callback: Any = None,
         hp_drop_callback: Any = None,
+        exp_stall_callback: Any = None,
     ) -> None:
         super().__init__(name="status-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -2235,6 +2236,12 @@ class StatusWorker(threading.Thread):
         # movement callback owns marker direction and input, keeping the two
         # paths decoupled.
         self.hp_drop_callback = hp_drop_callback
+        self.exp_stall_callback = exp_stall_callback
+        self.exp_stall_enabled = False
+        self._exp_stall_last_at = float("-inf")
+        self._exp_stall_last_fingerprint: Optional[np.ndarray] = None
+        self._exp_stall_unchanged = 0
+        self._exp_stall_paused = False
         self._low_count = {"hp": 0, "mp": 0}
         self._last_potion = {"hp": float("-inf"), "mp": float("-inf")}
         self._potion_verification: dict[str, Optional[dict[str, float | int]]] = {
@@ -2417,6 +2424,7 @@ class StatusWorker(threading.Thread):
             LOG.warning("ignored frame without PIL image")
             return
         reading = self.detector.detect(image)
+        self._check_exp_stall(image)
         # Routine samples arrive at the shared capture cadence.  Keep them
         # available for diagnosis without burying movement and alert events.
         LOG.debug("status hp=%s mp=%s exp=%s confidence=%.2f",
@@ -2518,6 +2526,68 @@ class StatusWorker(threading.Thread):
         # potion decision.
         self._last_hp = reading.hp
         self._last_mp = reading.mp
+
+    def set_exp_stall_monitor(self, enabled: bool, callback: Any = None) -> None:
+        """Arm the 10s EXP-growth gate; three unchanged samples pause attacks."""
+        self.exp_stall_enabled = bool(enabled)
+        if callback is not None:
+            self.exp_stall_callback = callback
+        self._exp_stall_last_at = float("-inf")
+        self._exp_stall_last_fingerprint = None
+        self._exp_stall_unchanged = 0
+        if self._exp_stall_paused and callable(self.exp_stall_callback):
+            self.exp_stall_callback(False)
+        self._exp_stall_paused = False
+
+    @staticmethod
+    def _exp_text_fingerprint(image: Image.Image) -> np.ndarray:
+        """Return the visible EXP-number strip without assuming its format.
+
+        The status capture is already resolution-normalised by the capture
+        worker.  This narrow upper-right strip contains the EXP label and its
+        changing number/percentage, while excluding the animated yellow fill
+        below it.  It is intentionally a visual signature, not OCR: variants
+        such as ``123[4.5%]`` and ``123 (4.5%)`` both work unchanged.
+        """
+        grey = np.asarray(image.convert("L"), dtype=np.int16)
+        height, width = grey.shape[:2]
+        return grey[
+            0:max(1, round(height * 0.45)),
+            round(width * 0.65):max(1, round(width * 0.98)),
+        ]
+
+    def _check_exp_stall(self, image: Image.Image) -> None:
+        if not self.exp_stall_enabled:
+            return
+        now = time.monotonic()
+        if now - self._exp_stall_last_at < 10.0:
+            return
+        current = self._exp_text_fingerprint(image)
+        previous = self._exp_stall_last_fingerprint
+        self._exp_stall_last_at = now
+        self._exp_stall_last_fingerprint = current
+        if previous is None or previous.shape != current.shape:
+            changed = True
+        else:
+            # Ignore sub-pixel capture shimmer while accepting a single digit
+            # change.  A changed glyph alters dozens of pixels in this 18px
+            # high strip; requiring only 0.5% avoids treating one noisy edge
+            # as EXP growth.
+            changed = bool(np.mean(np.abs(current - previous) > 20) >= 0.005)
+        if changed:
+            self._exp_stall_unchanged = 0
+            if self._exp_stall_paused:
+                self._exp_stall_paused = False
+                LOG.info("EMPTY ATTACK: EXP resumed; movement and attacks re-enabled")
+                if callable(self.exp_stall_callback):
+                    self.exp_stall_callback(False)
+            return
+        self._exp_stall_unchanged += 1
+        if self._exp_stall_unchanged >= 3 and not self._exp_stall_paused:
+            self._exp_stall_paused = True
+            LOG.warning("EMPTY ATTACK: EXP unchanged for 30s; movement and attacks paused")
+            if callable(self.exp_stall_callback):
+                self.exp_stall_callback(True)
 
     def _write_status_state(self, reading: "StatusReading") -> None:
         """Publish the latest HP/MP ratios for other workers (JSON file)."""

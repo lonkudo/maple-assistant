@@ -82,7 +82,8 @@ class AbnormalNotifier:
             return f"异常警报（类型：{category}，{note}）"
         return f"异常警报（类型：{category}）"
 
-    def notify(self, event_type: str, *, stop: bool = True, stage: str = "") -> bool:
+    def notify(self, event_type: str, *, stop: bool = True, stage: str = "",
+               force_delivery: bool = False) -> bool:
         """Deliver one abnormal alert if selected; return whether it was accepted.
 
         ``event_type`` is intentionally mandatory at the boundary, so every
@@ -109,7 +110,7 @@ class AbnormalNotifier:
                 event_callback(str(event_type or "未分类"))
             except Exception:
                 LOG.warning("abnormal event safety stop failed", exc_info=True)
-        if not enabled:
+        if not enabled and not force_delivery:
             LOG.debug("abnormal notification delivery suppressed: master gate is off")
             return False
         if self._flash_callback is not None:

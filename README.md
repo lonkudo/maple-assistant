@@ -49,6 +49,96 @@ If a required library is missing, the normal package repairs itself: the hidden 
 
 The update icon in the title bar turns green when the activation server announces a newer version; hovering shows that version's 更新说明, and clicking opens the **更新** window (v1.3.50). That window lists every version the operator offers — the announced one first — with its 更新说明, and each row has **仅下载保存** (the ZIP is downloaded into `<root>\版本` and kept) and **下载并安装** (the supervisor installs that copy; the library copy stays). An older version can be listed and installed on purpose: the picked version is the authority, not the newest, and a rollback row does not light the title-bar icon. The download comes from that version's 更新链接 record (netdisk share); the archive is verified before anything is unpacked. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, clears any other assistant instance that still holds the packaged files or the single-instance mutex, installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app through `MoonEclipse.exe`, then `launch_assistant.vbs`, then `启动助手.bat`, retrying once and logging the PID it started. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. **导入配置** is deliberately separate from package updates: it validates the selected JSON, stops patrol, atomically replaces the live configuration in a background task, then redraws the user-owned panels in the current assistant. The status line shows `↻ 正在刷新导入配置…` while this happens; it does not need a manual restart.
 
+### Current release behavior (v1.3.53 – v1.3.63)
+
+- **Starting 本地测谎 can no longer take the assistant down with it.** Stopping the
+  vendor service is the only path in the app that terminates a process, and it
+  used to derive "the service" from whatever folder the state happened to hold.
+  On the CT-card path `note_online_card()` calls
+  `supervisor_set_active(True, install_root())`, and that function recorded the
+  **assistant's own folder** as the service folder with `started_by_app=True`;
+  `find_service_root()` additionally had a bare-install-root fallback while
+  `BINARY_PATTERNS` ends with `*.exe`, and the stop's last resort ran
+  `taskkill /F /PID` for every process whose IMAGE NAME matched. The result was a
+  flash close with nothing to read: no `Application Error`/`Hang` event, no dump,
+  no traceback, `assistant.log` ending on the licence-heartbeat line in the same
+  second the CT card was written. Four rules now hold, and each is covered by the
+  guard checks run against this build:
+  * the install root is **never** a service folder (`find_service_root()` has no
+    bare-root candidate; a folder must hold the vendor launcher or a non-app
+    executable);
+  * `_binary_names()` and `_service_pids()` exclude this program's own image names
+    (`MoonEclipse.exe`, `TodoHelper.exe`, `python.exe`, `pythonw.exe`,
+    `sys.executable`) and the current pid;
+  * every pid is verified by **executable path** (pywin32 sweep, then `psutil`), and
+    nothing is killed by image name any more — no path-verified pid means nothing is
+    killed and the log says so;
+  * `instance_state.terminate()` refuses its own pid.
+  `_state["root"]` now records the service folder (or `""` when the package is not
+  installed), and the stop line carries `folder=…, pids=…, this pid=…`.
+- **A stop only ever touches the vendor, and the vendor is only stopped when this
+  app started it.** `work\local-lie-owner.json` survives restarts, so a service the
+  assistant launched in an earlier session is adopted (managed) again instead of
+  being abandoned as `external`; a service the operator started by hand has no
+  marker and is never killed. The stop waits for the vendor to really exit
+  (`SERVICE_STOP_WAIT_SECONDS = 6`) so the next start does not collide on 8765.
+- **The installer waits for the authorisation instead of cancelling the install.**
+  A missing licence is a new location, not a refusal: the installer asks the two
+  customer steps (bind the licence here → the activation code) and, when either is
+  dismissed, shows `等待授权完成…` in the status row and asks again after
+  `AUTHORIZATION_WAIT_RETRY_SECONDS = 15 s`. The install continues by itself once a
+  code works — no "已取消：没有绑定授权，本次不安装" dead end. A refused code (expired,
+  bound elsewhere, invalid) takes the same route: wait, then ask again, and the
+  `MAX_CODE_ATTEMPTS = 4` counter resets after each wait instead of ending the run.
+  Closing the window ends the wait immediately (`WM_DELETE_WINDOW` sets `closed` and
+  releases the parked question), instead of the question sitting for up to
+  `CODE_REQUEST_TIMEOUT_SECONDS = 600`.
+- **A launch that finds a stalled owner takes over silently** (see
+  `instance_state.py`): `work\instance.json` + `work\instance.beat` are published and
+  refreshed from the UI poll, so the next launch can tell a live instance from one
+  whose UI is blocked, whose dialog landed behind the game, or that has no window at
+  all. The takeover is one line in `work\single-instance.log` and never a prompt.
+- **A death is countable now.** `work\run-marker.json` is written at startup and
+  stamped clean at shutdown; a run that ends without that stamp appends one line to
+  `work\unclean-exits.log` (time, version, old pid, and the last line of
+  `assistant.log`, which is usually where it died). Native faults also get a
+  minidump (`HKLM\…\LocalDumps\MoonEclipse.exe` → `work\dumps`, `DumpType=1`,
+  `DumpCount=3`) and the Tk watchdog (`UiHangWatchdog`, 3.5 s) dumps all threads to
+  `work\ui_hang_trace.log` before Windows' own 5 s "not responding" test.
+- **A skill cast no longer reads as "stuck on a rope".** `_skill_cast_in_flight()`
+  freezes the self-rescue stall counter and its anchor instead of counting or
+  resetting the run: the 18:42 log showed ten stationary frames during a cast that
+  probed Left/Right against the arbiter's own motion and jumped the character off
+  layer2.
+- **Vertical movement is not "no progress".** The on-route stall check returns
+  early while the arbiter owns a climb (`_movement_busy_now()`, return mode, rope,
+  stair, jump), and off-route progress is judged on X plus a **monotone** vertical
+  run (`OFF_ROUTE_MONOTONE_PROGRESS = 0.04`, `OFF_ROUTE_MONOTONE_STREAK = 3`,
+  `OFF_ROUTE_STEP_EPSILON = 0.004`): a slow climb advances in one direction and
+  counts, a rope bob flips sign every frame and does not.
+- **The unresolved-floor ladder needs a real descent, not a bob.** `Alt+Down` is
+  only accepted once `UNRESOLVED_FLOOR_DROP_FRAMES = 4` descending frames and
+  `UNRESOLVED_FLOOR_SWEEP_FRAMES = 3` monotone frames have confirmed the fall; the
+  Direction+Down edge hold likewise waits `UNRESOLVED_EDGE_DESCENT_FRAMES = 3`
+  samples. Giving up is no longer permanent: after the last attempt the ladder
+  retries once per `UNRESOLVED_DROP_RETRY_COOLDOWN_SECONDS = 30`, and the layer
+  recovery owns the layer while it runs (`recovery_owns_layer()` pauses the attack
+  worker) so a rescue never fights the chord sequence.
+- **A rope escape is only cancelled by a real drop.**
+  `DROP_ROPE_ESCAPE_MATERIAL_DESCENT = 0.08` replaces the old "any movement larger
+  than the tiny-step window" rule: a character bouncing on a rope swings its marker
+  0.04–0.07 per frame and used to clear the whole watch on the first bob, which made
+  the escape unreachable.
+- **A `left+down` chord is never split.** `_edge_chord_owns()` guards
+  `_release_endpoint_walk()`, `_begin_endpoint_turn()` and the walk-direction
+  switch, and `_start_reconnect_drop_edge_hold()` never splits a chord, because
+  `force_key_up()` bypasses the input ledger: the field log showed
+  `key-up forced=left reason=patrol endpoint reached` releasing the Left half while
+  Down was still held.
+- **The flower acceptance is asymmetric** (v1.3.59): a recorded 花 point accepts
+  0.005 below and 0.015 above its Y, so the climb carries past the point instead of
+  stopping one marker row under it. See the layer/flower section below.
+
 ### Current release behavior (v1.3.49 – v1.3.52)
 
 - **A hidden start now says 启动中... while it loads.** `启动助手.bat` runs a
@@ -125,7 +215,9 @@ The update icon in the title bar turns green when the activation server announce
   frames.** v1.3.4x briefly delayed 声音/闪烁/消息 until two consecutive scans
   matched, to stop a 钉钉 `测谎警报` that arrived with no lie on screen on
   2026-11-15. That removed the alarm instead of the false alarm: the grey
-  `#c9ced0` block is a *transitional paint*. Replaying the diagnostic recordings
+  `#c9ced0` block is a *transitional paint*. The detector accepts a small ±14
+  RGB-channel tolerance, so this first block may be slightly darker or lighter
+  on another client. Replaying the diagnostic recordings
   (`screenshots/lie_*`, which start on the first sighting — the detector sees the
   game at 5 FPS) gives 142 frames with **exactly one** match: the next frame
   already shows the popup at ≈`#f3f4f7`, 46 grey levels above the target, so a
@@ -1415,13 +1507,21 @@ is a private rope waypoint, not a floor: after attachment is proven, one marker 
 layer confirmation. A layer containing only a 花 point is legal for the 等死花 startup check and
 does not need 最左/最右 or to be recognised as a patrol layer.
 
-**随机休息** is the only option here that touches both workers. It is available in 巡逻攻击,
-站桩攻击 and 双桩模式 (greyed out elsewhere) and takes a break every `75m~120m`, lasting
-`3s~15s`; both numbers are drawn fresh each time. During a break the movement worker issues no
-walk/climb/drop command and the attack workers see the shared action-input block, so the character
-simply stands still and then continues on the same leg. Patrol is not stopped, nothing re-anchors,
-potions and the 增益 schedule keep running, and the break frames are excluded from the stall
-detector. The panel hint reads `每75m~120m 休息3s~15s`.
+**定时休息** is available in 巡逻攻击, 站桩攻击 and 双桩模式 (greyed out elsewhere). It
+uses two direct values: `每 N 分，休息 N 分`; each actual duration has a one-sided 0–5% random
+extension. Record a pink `休` point with Ctrl+H. When the interval expires, the movement worker
+takes private ownership of the route, climbs to that recorded rope point, and begins the rest only
+after rope attachment and the point's Y are verified. During the rest both movement and attacks
+pause; buffs and potions remain independent. At the end it uses the same bounded rope-departure
+jump as 等死花, then hands the next normal patrol round back to the route. A 休-only layer is valid
+while 定时休息 is enabled: its recorded Y supports layer recognition but it does not add a patrol
+edge.
+
+**空打** is an EXP-progress safety alert. The status worker compares a small visual fingerprint of
+the EXP-number area every 10 seconds. Three unchanged comparisons (30 seconds) raise the alert and
+pause **both** attack cadence and movement input; held walk/climb/drop keys are released by the
+movement worker. A later EXP change resumes the same patrol automatically, without re-anchoring or
+requiring Start Patrol.
 
 Numeric settings use the shared compact direct-value control rather than a slider. Hover enlarges a
 value; the mouse wheel changes it by one configured step; left-click changes it by ten steps upward;
@@ -1787,8 +1887,25 @@ client–server diagnostic trail.
 rewritten at every Start Patrol with the version, the recording snapshot and then
 that run's lines, and it no longer rotates, so the earlier part of a long run is
 never dropped and nothing accumulates across runs. Attach that one file - it is
-self-contained. `crash_report.log` and `ui_hang_trace.log` survive a restart;
-everything else is cleared at launch.
+self-contained.
+
+The evidence that must survive a restart is kept (everything else is cleared at
+launch):
+
+| File | What it answers |
+| --- | --- |
+| `work\crash_report.log` | Python exception dumps and the faulthandler "handler armed" line |
+| `work\unclean-exits.log` | one line per run that ended without a clean shutdown: time, version, pid, and the LAST line of that run's `assistant.log` |
+| `work\run-marker.json` | the marker behind that line (written at start, stamped clean at shutdown) |
+| `work\dumps\` | a minidump of a native fault (`DumpType=1`, `DumpCount=3`) |
+| `work\ui_hang_trace.log` | all-thread dump when the Tk thread stalls 3.5 s (before Windows' own 5 s verdict) |
+| `work\single-instance.log` | a duplicate launch and a silent takeover of a stalled owner |
+| `work\startup-error.log`, `assistant-launch-*.log`, `update-helper.log` | a launch or update that failed before the window existed |
+
+A "it closed by itself" report is countable from `work\unclean-exits.log`: its last
+log line names the exact work in progress. No Windows `Application Error`/`Hang`
+event plus no entry there means the process was terminated rather than crashed —
+which is what the local-lie stop rules above were fixed for.
 
 For a failed patrol start, check in this order:
 
@@ -1936,6 +2053,7 @@ number alone.
 
 | Release version | Git tag | Status |
 | --- | --- | --- |
+| `1.3.53` – `1.3.63` | — | The local-lie stop identity rules (never the assistant's own folder, image or pid; path-verified pids; the machine-wide `taskkill` by image name removed), the installer's authorisation wait instead of an aborted install, `instance_state.py` single-instance takeover, the crash/unclean-exit/minidump recorders, the asymmetric flower band, the unresolved-floor descent gates with a give-up cooldown, the self-rescue skill-cast and vertical-motion exclusions, the never-split Direction+Down chord, and the geometric up-jump paired band rule (`layers/layer_band` schema 6). **Untagged: built from an uncommitted working tree.** |
 | `1.3.36` – `1.3.48` | — | The one-frame 测谎 alarm (restored after the two-scan confirmation silenced it), the 本地测谎 credential authority (`data/ct_login_config.json` is written before the vendor starts and scrubbed after every outcome, memory always wins over the file), `非正常运行` as the only 卡地图 report, the `异常` 下机, the 1.3.40 "walks to the right edge at start" fix, the compact 药品/定时巡逻/小碎步 rows with left-hugged numeric cells, and the single `无法开始: 检测不到游戏窗口` start hint. `1.3.47` is commit `806947f` and `1.3.48` is commit `c2f3b31`; the documentation below was written after that build and describes the same code. **Untagged: the intermediate builds were superseded and pruned.** |
 | `1.3.27` – `1.3.35` | — | 站桩 recovery in the marker's own rows and columns, 范围桩, 延时回桩 `1.0–2.0 s`, the world-Y floor guard, the retired five-minute rescue sweep, the multi-instance relaunch helper, the installer readiness wait, and the 本地测谎 start policy. **Untagged: the source is the commit that carries this document; the intermediate builds `1.3.27` – `1.3.34` were superseded and pruned.** |
 | `1.3.26` | — | Installer activation parity, 被撞反击 in 巡逻攻击, a healed 本地测谎 hint, and symmetric 0.02 layer bands. **Committed, untagged.** |
@@ -2117,6 +2235,15 @@ a card.
   card and handshakes the cloud before it binds 8765 — and a vendor process that exits
   is reported at once with the vendor's own reason. A failed attempt retries after 3 s,
   with a budget of 8 attempts before the panel settles on 启动失败.
+* **A stop can only reach the vendor.** The service folder is resolved once
+  (`find_service_root()` — the assistant's own folder is never a candidate) and both
+  discovery and pid lookup exclude this program's image names and its own pid. Every
+  pid is verified by executable path, so the stop can never target the assistant, an
+  unrelated process, or a process that merely shares a file name; when nothing is
+  path-verified, nothing is killed and the log records that. The stop line carries the
+  folder, the pids and this process's own pid, so the next field log answers "what did
+  it stop" without guessing. See `### Service lifecycle` under 本地测谎 in this file and
+  `local_lie_service.py — lifecycle and activation` in `ARCHITECTURE.md`.
 
 ### Reporting
 

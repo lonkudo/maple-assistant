@@ -494,6 +494,7 @@ Patrol has these core rules:
 - A return drop ends on landing evidence read from the marker, never on the world-Y tracker: the marker's own recorded band, or — when the landing is away from the recorded row and therefore matches no band — the at/below-bottom-floor and bounded nearest-floor answers ordinary patrol already uses. Those answers are computed over **every recorded floor** (`_landing_candidate_layers()`), not only the patrol range: with a single-floor range the floor a descent is aimed at is otherwise not even a candidate. Both relaxed answers require an Alt+Down chord to have really moved the marker down by at least `RECONNECT_DROP_Y_PROGRESS` (0.015) and the reading to hold for two consecutive settled frames, so a character falling *through* a floor is never read as landed. The world-Y tracker is excluded here because at a fresh start above the route its origin is anchored to the route's top floor while the character is still above it.
 - The world-Y tracker is guarded against its own drift (v1.3.35). The two shift estimates (against the stored reference and against the previous frame) must agree within `ESTIMATOR_AGREEMENT_DIAMONDS = 0.35` diamond before one may replace the other — the previous 1.50 / 0.75 allowed a silent switch more than two floors apart. `reanchor_world_y()` refuses a correction larger than `WORLD_REANCHOR_MAX_FLOOR_FRACTION` (one floor) and logs the refusal, because such a correction means the floor belief is wrong and writing it puts the coordinate outside every recorded band. `_world_drift_check()` re-anchors a cruising drift (strict, so refused when a floor or more) at most `WORLD_DRIFT_MAX_REANCHORS` (2) times per `WORLD_DRIFT_WINDOW_SECONDS` (20 s) and then marks the origin untrusted instead of trusting a belief. Evidence: the 11:24 log re-anchored +1.647 and then −1.602 while the character stood still at its 桩, after which every floor read unresolved and the unresolved-floor recovery started pressing Alt+Down.
 - A marker that matches **no recorded floor at all** is an unresolved floor, and the worker changes layer deliberately instead of walking it (`_unresolved_floor_drop_decision()`). It arms after four settled frames, presses Alt+Down, and after two chords without downward progress holds the nearer outer side (X > 0.5 → left, X < 0.5 → right) for 5 s, then the opposite side, resuming the chords whenever a hold produces a descent; it stops after 3 edge cycles or 12 chords. Since v1.3.51 those two side passes are `drop_edge_left_down` / `drop_edge_right_down` — the reconnect respawn's Direction+Down hold, started through `_start_reconnect_drop_edge_hold(..., source="unresolved")` with the rope-attach watch armed for that side — and not plain walks: left/right are ignored on a rope, while the Down half still slides it (the 14:54 log stayed at `pos=(0.260000, 0.230392)` through a plain-walk pass on each side). Placement matters: the check runs after `route-complete` and before `stationary-attack`, so it preempts the anchor/patrol walking an unresolved reading would otherwise produce. It is gated on real vertical owners only — `_return_mode`, `_descending_to_first`, `_climb_state.up_held`, a jump-point Up claim, the reconnect drop recovery (and only while its `drop-to-route` return is running), a pickup leg, and a pending post-reconnect route check — and `_unresolved_drop_blocker()` names the owner in the log. `_climb_state.phase` is deliberately *not* a gate: a completed rope attempt leaves the phase non-idle after Up was released, and treating that bookkeeping as a climb kept the recovery from ever running.
+- **The ladder needs a real descent, and giving up is not permanent (v1.3.53–v1.3.63).** A character bouncing on a rope moves one marker row on almost every frame, so "the marker moved" is not evidence of a fall: the Alt+Down accept now requires `UNRESOLVED_FLOOR_DROP_FRAMES = 4` settled frames AND `UNRESOLVED_FLOOR_SWEEP_FRAMES = 3` further **monotone** descending frames (the 16:01 log oscillated 0.097938 ↔ 0.170103 for six seconds and not one chord was sent), and the Direction+Down edge hold only counts as "there is a drop here" after `UNRESOLVED_EDGE_DESCENT_FRAMES = 3` samples stay down (one sample below the start cancelled every hold after ~0.2 s in the 17:48 log). Running out of attempts is no longer the end: after the last chord the ladder waits `UNRESOLVED_DROP_RETRY_COOLDOWN_SECONDS = 30` and tries again, instead of leaving the character parked for ever (`action=wait (left-most reached or crossed)`). While the ladder runs it owns the layer: `recovery_owns_layer()` makes `AttackWorker._recovery_blocked()` pause attacks and keeps the self-rescue probe from restarting the episode mid-sequence, and a completed rope attempt that produces no landing never re-arms the Up hold.
 - A planned descent never spends a chord on a falling marker (v1.3.51). `_final_drop_arrived()` requires at least one real Alt+Down chord before it accepts a landing, and that rule used to press Down+Alt on a marker that was still mid-fall — the 12:32 log did it one capture after the 等死花 rope departure, on a character standing on layer1, which reads as a wrong jump because Alt is the game's jump key. Two gates keep it honest: the `drop` branch of the frame loop withholds the chord while `self._marker_settled_now()` is false for a descent (`_descent_drop_needs_settled_marker()` covers `drop-to-first`, the return drop and the split/timed circuits) and logs `DROP hold: …`; and `_descent_entry_on_first_layer` — recorded on the frame that ARMS the descent — lets a descent that began with the marker already inside the first layer's band be accepted on a settled marker, because there is nothing under the character to drop through.
 - Vertical ownership claims are dropped together with the physical key. `_forget_up_claims()` clears `_climb_state.up_held` and the whole jump-point session, and `_release_stuck_keys()` calls it immediately after its forced key-ups — the Start Patrol, confirmed-fall and global `INPUT RESET` paths all pass through there. `_begin_jump_point_pass()` refuses to inherit a claim from the previous pass, and `_jump_point_session_expired()` releases a jump-point claim that produced no landing, no handoff and no rising marker after `JUMP_POINT_SESSION_MAX_SECONDS` (3 s). A claim that outlives its key is what replaced every later rope climb with `action=wait (recorded directional jump point owns Up; waiting for landing)`.
 - Rope jumps have no patrol-start grace (v1.2.280). Standing inside the rope band means the mount jump is the wanted action; the old three-second "do not jump onto the rope the character happens to start next to" hold cost three seconds of every Start Patrol at a rope and left the attack blocked for the same window. The stair-jump stall detector keeps its own start grace, because a character that has not moved yet is not one stuck at a stair.
@@ -536,6 +537,20 @@ left↔right turnover is unchanged.
 
 Movement never sends raw, competing direction requests. Every decision goes through the input boundary and, for atomic motions, the dedicated motion worker.
 
+**A Direction+Down chord is never split (v1.3.63).** `_start_reconnect_drop_edge_hold()`
+owns a two-key action, while `_release_endpoint_walk()`, `_begin_endpoint_turn()` and the
+walk-direction switch could each release just the direction half through
+`force_key_up()`, which bypasses the input ledger and therefore does not know a chord is
+held: the field log showed `key-up forced=left reason=patrol endpoint reached`
+releasing Left while Down stayed down. `_edge_chord_owns()` now guards all three call
+sites, so an edge hold ends only when the whole chord is released.
+
+The rope escape (`DROP_ROPE_ESCAPE_*`) is cancelled by a **real** descent only:
+`DROP_ROPE_ESCAPE_MATERIAL_DESCENT = 0.08` replaced "any movement larger than the
+tiny-step window", because a character bouncing on a rope swings its marker 0.04–0.07
+per frame and cleared the whole watch on the first bob, which made the escape
+unreachable.
+
 Self-rescue uses a private `MovementWorker` ownership gate rather than the
 shared `PatrolController`. A suspected stall is verified after
 `rescue_stuck_frames` near-unchanged captures (the shipped 10 frames ≈ 2.0 s at
@@ -554,6 +569,19 @@ cannot generate `patrol-paused`, a false external-stop UI update, or a normal
 route `wait` decision. Only a confirmed rescue holds this private gate while
 it performs its separate recovery work; only terminal failure or auto reconnect
 may disable the shared patrol controller.
+
+**What does not count as a stall (v1.3.53–v1.3.63).** Three false positives were
+closed. A recorded skill point freezes horizontal movement for its cast (~0.55 s), and
+those frames used to count: the 18:42 log showed ten stationary frames during a C cast
+probing Left/Right against the arbiter's own motion, declaring the character stuck on a
+rope and jumping it off layer2 — `_skill_cast_in_flight()` now freezes the counter and
+the anchor (it neither counts nor resets, so the honest 10-frame / 2 s detection is not
+pushed out to ~5 s either). Vertical movement is not "no progress": the on-route block
+returns early while `_movement_busy_now()` (rope climb, stair, jump) or a return mode
+owns the character. And off-route progress is judged on X plus a **monotone vertical
+run** — `OFF_ROUTE_MONOTONE_PROGRESS = 0.04` accumulated in one direction over
+`OFF_ROUTE_MONOTONE_STREAK = 3` steps larger than `OFF_ROUTE_STEP_EPSILON = 0.004` — so
+a slow climb counts while a rope bob (sign flips every frame) does not.
 
 An attached rope climb has a separate raw-position watchdog. `ClimbState`
 retains its last marker X and Y; four consecutive fresh captures with neither
@@ -814,14 +842,44 @@ delivery, flower event, rope departure, or landing is allowed to reset it. Ten s
 deadline, `_wait_dead_flower_route()` selects a recorded flower point and `_route_target_impl()`
 temporarily returns that point's X as the next rope target. A flower point is **not** added to
 `_route_layers` and never becomes a layer-band supporter: it may be in mid-air on a rope. After
-the normal climb state has independently proven rope attachment, the first marker-Y sample within
-`DEAD_FLOWER_Y_TOLERANCE` (`±0.010`) of the flower Y switches to the private wait state and
-releases Up immediately. It intentionally bypasses the ordinary two-stable-frame floor resolver;
+the normal climb state has independently proven rope attachment, the first marker-Y sample inside
+the **asymmetric** flower band (`dead_flower_y_accepted(gap)` with `gap = flower.y − player.y`,
+`DEAD_FLOWER_Y_ACCEPT_BELOW = 0.005` / `DEAD_FLOWER_Y_ACCEPT_ABOVE = 0.015`, v1.3.59) switches to
+the private wait state and releases Up immediately. The band is asymmetric because a climb approaches
+from below and one marker step is ~1.4 rows: a symmetric band stopped on the first sample inside it,
+which parked the character slightly LOW every time (17:24 field log: `y_gap=-0.001202`, and every
+earlier stop negative). Accepting only 0.005 below but 0.015 above lets the climb carry past the point
+into the generous side. The climb machine itself keeps Up held inside the WIDER (upper) side, so it is
+never stricter than the acceptance. It intentionally bypasses the ordinary two-stable-frame floor
+resolver;
 that resolver would keep Up held and climb through the flower. At the deadline, the private state
 uses the established rope departure jump and then returns vertical descent/next-loop ownership to
 the normal route state machine. Patrol startup validation accepts a flower-only layer only for
 this enabled 巡逻攻击 option; it remains excluded from normal route construction, so other modes
 retain their ordinary 最左/最右 requirements and layer-resolution semantics.
+
+**定时休息** is another private `MovementWorker` route, available to normal patrol and the two
+stationary modes. The UI persists `timed_rest_enabled`, interval and duration; Ctrl+H records a
+pink `rest_points` waypoint (`休`). Its Y participates in the layer's support band, and a layer
+containing only that waypoint is accepted while the feature is enabled, but it is never a normal
+left/right/rope patrol action. `_service_timed_rest_schedule()` owns the wall-clock interval and
+the 0–5% one-sided random extension. At expiry it selects a recorded rest point, sets
+`_timed_rest_preparing`, and `_route_target_impl()` gives that private target precedence over a
+stale stationary return or `drop-to-route` state. `_run_climb_step()` verifies attachment and the
+private point Y before starting `_timed_rest_until`; only then does the schedule consume ordinary
+movement frames and pause attacks. Expiry enters `_timed_rest_leaving`, which makes the bounded
+Alt+Left rope departure before `_finish_timed_rest_round()` returns ownership to the normal route.
+Refreshing panel settings during any of these states updates only the next round's timings: it does
+not clear the live private target and accidentally hand the rope to generic Alt+Down recovery.
+
+**空打** is a two-worker EXP-progress safety gate. `StatusWorker` samples a visual EXP-text
+fingerprint every 10 seconds; three unchanged samples invoke the coordinator callback. That callback
+sets both `AttackWorker.exp_stall_paused` and `MovementWorker.exp_stall_paused`. On its next capture
+frame, `_service_exp_stall_pause()` releases movement-owned walk, climb, jump-point Up and
+Direction+Down recovery input, clears stale climb bookkeeping, and emits no new route decision.
+The workers remain alive and continue observing frames. A changed later fingerprint clears both
+flags, so the existing patrol state resumes without a new Start Patrol. Buffs and potions remain
+independent of this gate.
 
 In stationary attack mode, the temporary anchor is captured only on a manual patrol start. Its X/Y recovery band is local to that anchor and never depends on a recorded layer (the window, facing shift, 范围桩 option and hand-over rules are in the stand-still attack section above). A requested stationary facing is queued only after a real recovery or a later setting change: startup deliberately records the current position without injecting a directional tap. 双向 changes the desired facing after 80 settled observations; the arbiter performs one short facing tap rather than a walking movement.
 
@@ -949,7 +1007,7 @@ The live frame stream uses the shared capture cadence. The temporary detection r
 
 `lie_detector_worker.LieDetectorWorker` owns the *event* side of that stream, and its alarm is one frame wide by design. `_update_alert()` raises 声音 (`dingdong.mp3` through `run_sound_async`, never inline), 闪烁 (`screen_blinker`) and 消息 (`_message_alert`) on the **first** scan whose `detect_lie_square()` returns a box, at most once per window (`_alerted_for_current_event`), and the first scan that returns `None` re-arms it — which is what lets the next lie window alert again. Every scan of a window that stays up is still forwarded to the raw listeners (`add_lie_seen_callback`: the diagnostic recorder and the auto-lie candidate forwarder), so only the operator-facing alarm is rate-limited, not the diagnosis.
 
-That width is not tunable. The grey `#c9ced0` block is a transitional paint: in the diagnostic recordings, which begin on the first sighting, 142 frames contain exactly one match, because the next frame already shows the popup at ≈`#f3f4f7`. A "two consecutive matching scans" confirmation therefore fires never, not rarely — replaying those frames through the worker gave 0 alarms and 0 flashes. Beware the tempting inverse too: `set_enabled()` clears `_alerted_for_current_event` whenever the panel re-applies settings, so any confirmation state would have to be re-derived from the frames themselves instead of carried across a settings refresh. Filtering a false alarm belongs on the 测谎 window's geometry and contents, never on a run of grey frames.
+That width is not tunable. The grey `#c9ced0` block is a transitional paint: `detect_lie_square()` accepts a modest ±14 RGB-channel tolerance so the same first-stage square can be slightly darker or lighter on another client, while the fixed scaled square dimensions still reject unrelated grey areas. In the diagnostic recordings, which begin on the first sighting, 142 frames contain exactly one match, because the next frame already shows the popup at ≈`#f3f4f7`. A "two consecutive matching scans" confirmation therefore fires never, not rarely — replaying those frames through the worker gave 0 alarms and 0 flashes. Beware the tempting inverse too: `set_enabled()` clears `_alerted_for_current_event` whenever the panel re-applies settings, so any confirmation state would have to be re-derived from the frames themselves instead of carried across a settings refresh. Filtering a false alarm belongs on the 测谎 window's geometry and contents, never on a run of grey frames.
 
 A server answer is fed to the real cursor as a physical desktop point. `api_lie_test.py` converts the answer with `point.to_screen()`, the same conversion its overlay draws with, and pushes it through `MouseAimController.push_screen_target(..., immediate=True)`. Sending it as client pixels would re-map an already-correct screen coordinate through the video's client rectangle, which is wrong under DPI virtualization because the captured bitmap and Windows' logical client size differ; `immediate=True` also bypasses the interactive viewer's dead band and speed limit, both of which are hover affordances rather than part of an automated pass.
 
@@ -1178,6 +1236,25 @@ note for the completion dialog and the client can still activate. That path deli
 uses `/api/v1/activate` rather than the preview/confirm pair because the installer runs
 before any heartbeat could re-anchor anything, and the tolerant device check
 (`binding_matches`) makes it accept a restored PC.
+
+**The installer waits for the authorisation instead of cancelling (v1.3.63).** A folder
+without a licence is a NEW location, and the installer is not allowed to end the run
+because the customer has not finished: `_await_authorisation()` runs on the install
+thread, asks the two customer steps through the Tk thread
+(`_request_code_from_operator()` → the `code-ask` drain branch: 绑定授权 first, then
+the activation code), and when either is dismissed it puts `等待授权完成…` in the
+status row (`("status", …)` event — no dialog) and asks again after
+`AUTHORIZATION_WAIT_RETRY_SECONDS = 15`. An accepted code continues into the ordinary
+version list → install path. A refused activation takes the same route: the reason is
+shown, the thread waits, and `MAX_CODE_ATTEMPTS = 4` only pauses the wording — the
+counter resets after each wait, so a wrong code never ends an install that the customer
+is still authorised to complete. Closing the window ends the wait at once:
+`WM_DELETE_WINDOW` → `_on_window_closed()` sets `self.closed`, releases the parked
+question and destroys the root, instead of the question sitting for
+`CODE_REQUEST_TIMEOUT_SECONDS = 600` (the wait polls that flag every 0.25 s). An
+existing installation still never asks: its code comes from `auth.json`
+(`_previous_install_profile_code()`), and the "is this PC licensed elsewhere?" question
+is only shown when another installation on the machine really carries an entitlement.
 
 **A brand-new PC waits for its own signals (v1.3.35, repaced v1.3.52).**
 `warm_device_identity(20.0)` re-reads the hardware signals until two of the three
@@ -1729,6 +1806,108 @@ stores `auto_lie.secret_key`, forwards the device document's `ct_card` to
 `apply_online_card()`, and refreshes the WS key through `sync_product_key()`. A
 `usage`-only reply (the local-lie accounting call) is explicitly **not** a licence
 document and never changes the card decision.
+
+**Process identity (v1.3.63).** Stopping the vendor is the only code path in the app
+that terminates a process, so the identity of "the service" is now established before
+anything is ever killed:
+
+* `find_service_root()` has exactly two candidates (`…\CT_Lie3_KR_partner_api_DML\…`
+  and its parent) and a folder only qualifies when it holds the package's launcher or
+  an executable that is not this program. The old third candidate was the install root,
+  and `BINARY_PATTERNS` ends with `*.exe` — so a package that did not ship the vendor
+  folder (`release_now.ps1` need not ship it) made the assistant's own
+  `MoonEclipse.exe` the "service binary", and a start attempt launched a second copy of
+  the assistant;
+* `_own_image_names()` (the frozen exe names, the source interpreter names, and
+  `sys.executable`) is subtracted in `_binary_names()` and `_service_pids()`, and
+  `_service_pids()` also drops its own pid. `_pid_is_service_binary()` requires the
+  executable path to start with the service folder, so a pid is never resolved from an
+  image name; when neither the pywin32 sweep nor the `psutil` sweep yields a verified
+  pid, `stop_started_service()` kills nothing and says so. The machine-wide
+  `taskkill /F /PID` by image name is gone — that call targeted the assistant's own
+  image whenever the recorded folder was wrong, and it is indistinguishable from a
+  flash close (no traceback, no WER event, no dump);
+* `_state["root"]` is written as the **service** folder. `supervisor_set_active()`
+  receives the assistant folder from its callers (`note_online_card()` passes
+  `install_root()`), and it used to store that value with `started_by_app=True` — the
+  stop then verified pids against the assistant's own directory. It now resolves the
+  service folder first, stores `""` and claims no ownership when the package is absent,
+  and only records ownership when that folder exists;
+* the stop loop refuses its own pid even if a caller ever hands it one, and
+  `instance_state.terminate()` does the same (a takeover that names its own pid would
+  kill the instance running the takeover);
+* ownership survives restarts through `work\local-lie-owner.json` (adopt or leave
+  alone), which is why a service the assistant launched in a previous session is
+  stopped again while a hand-launched one is never touched. The stop waits
+  `SERVICE_STOP_WAIT_SECONDS = 6` for the vendor to really exit, or the next start
+  collides on 8765 (the vendor binary is single-instance), and the closing log line
+  reports `folder=…, pids=…, this pid=…` so the next field log is self-explanatory.
+
+### Single-instance ownership and takeover (v1.3.63)
+
+`instance_state.py` is the only writer of `work\instance.json` (pid, exe, root,
+version, started) and `work\instance.beat`; `ui_worker` refreshes the beat from its poll
+(`BEAT_INTERVAL_SECONDS = 2`), so a beat age is a direct measure of whether the Tk loop
+still runs. A launch that cannot take the singleton mutex decides from that record and
+from the process itself, never from a prompt:
+
+* an owner whose beat is older than `STALLED_TAKEOVER_SECONDS = 120` is stalled — the
+  usual cause is Tk blocked inside a native modal that ended up behind the game;
+* an owner with a modal dialog nobody can see is stalled after
+  `UNSEEN_DIALOG_SECONDS = 10`, and an owner whose main window ignores a `WM_NULL` ping
+  is stalled after `UNRESPONSIVE_WINDOW_SECONDS = 5` (`SMTO_ABORTIFHUNG`);
+* with no record at all (an instance started by an older build) the candidates come
+  from the process table and the verdict from the process itself:
+  `NO_WINDOW_TAKEOVER_SECONDS = 120` without any window, or a window that does not
+  answer;
+* a responding main window always means live work and is never interrupted. The
+  takeover terminates the stalled pid and writes one line to `work\single-instance.log`
+  with no prompt at all; a duplicate launch that is NOT a takeover exits with its own
+  line and, because the hidden launcher has no console to print into, one explanatory
+  `MessageBoxW` (`MoonEclipse 已经在运行。…`), which is what an update restart used to
+  look like.
+
+Every ctypes prototype this module uses is declared with explicit `argtypes`/`restype`
+(HANDLE-sized), because the default `c_int` return truncates 64-bit handles and turned
+"the owner is alive" into "OpenProcess failed".
+
+### Crash evidence and unclean exits (v1.3.63)
+
+An intermittent "it closed by itself" has no trace by default: a native fault writes a
+`faulthandler` dump only when there is one, an external termination writes nothing at
+all, and the next launch rewrites `work\assistant.log`. Three recorders therefore run in
+every build, all observational (none of them can fail a start):
+
+* `crash_reporter.install_fatal_handler()` arms `faulthandler` on
+  `work\crash_report.log` (line buffered, append-only) and writes a
+  `fatal-signal handler armed | pid=…` line, so the absence of a dump is itself
+  information;
+* `crash_reporter.install_run_marker(version=…)` writes `work\run-marker.json`
+  (`pid`, `started`, `version`, `exe`, `clean=false`) and reports the PREVIOUS run when
+  its marker was never stamped by `mark_clean_shutdown()`: one line in
+  `work\unclean-exits.log` with the time, the old pid/start/version and the last
+  non-empty line of that run's `assistant.log` — usually the exact work in progress.
+  This is what makes flash closes countable instead of anecdotal;
+* `crash_reporter.enable_local_dumps()` sets
+  `HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\<image>`
+  (`DumpFolder = <root>\work\dumps`, `DumpType = 1`, `DumpCount = 3`) so a native fault
+  leaves a minidump that names the faulting module. It needs the elevation the launcher
+  already requests, and a refusal is silently ignored.
+
+`ui_hang_watchdog.UiHangWatchdog` covers the other half: the Tk poll kicks a one-shot
+`faulthandler.dump_traceback_later(3.5, exit=False)` on every iteration, so a stalled
+loop writes all thread stacks to `work\ui_hang_trace.log` BEFORE Windows' own 5 s
+"not responding" test (an Application Hang kills the process without a Python
+traceback). `exit=False` is deliberate: it observes, it never terminates.
+
+Reading the result: no `Application Error`/`Hang` event, no dump, no dump-armed
+traceback and no `unclean-exits.log` entry means the process was terminated rather than
+crashed. That signature — `assistant.log` stopping mid-line while the native recorders
+stay silent — is what identified the local-lie stop path as the killer of the 2026-11-19
+flash close.
+
+All of these files are in the log-cleanup keep list (`work\run-marker.json` is a
+`.json`, which that cleaner never touches), so the evidence survives the next launch.
 
 ### 本地测谎 access: one precedence list (v1.3.8)
 

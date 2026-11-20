@@ -29,9 +29,10 @@ LOG = logging.getLogger(__name__)
 # 1075px-wide client, so the HUD-reference (>=1366px) size is
 # round(60 * 1366/1075) = 76x76.
 LIE_SQUARE_COLOR = (201, 206, 208)  # #c9ced0
-# Small per-channel tolerance (0-255) so rendering/antialiasing shifts of
-# the exact color still match.
-LIE_COLOR_TOLERANCE = 10
+# Slightly wider per-channel tolerance (0-255): the first transitional lie
+# square can render a little darker or lighter across clients, while its fixed
+# HUD size still keeps the detector specific to this square.
+LIE_COLOR_TOLERANCE = 14
 REFERENCE_LIE_SQUARE_SIZE = (76, 76)
 # ONE matching scan IS the alarm.  v1.3.4x briefly required two consecutive
 # matching scans (to stop a 钉钉 "测谎警报" that arrived with no lie on screen on

@@ -184,23 +184,41 @@ MOVEMENT_STATUS_POSITION_LOG_DELTA = 0.003
 # interval drives the transition between flower points; the route never invents
 # a separate dwell timer.
 #
-# The Y band is the ARRIVAL acceptance used by "flower-reached".  On the current
-# 138x142 canvas one marker row is 1/142 = 0.007042, so 0.010 is about 1.4 rows:
-# on-row and one-row-off are accepted, and the two-row stop that looked too
-# generous in the field frame at 22:59:38 (y_gap=-0.014084, which the old 0.018
-# accepted) is not.  It stays above one row on purpose: the climb steps 1-3 rows
-# per frame at 5 FPS, and a band at or below a single row cannot absorb one
-# quantised read while the character settles.
+# The Y band is the ARRIVAL acceptance used by "flower-reached", and since
+# v1.3.59 it is deliberately ASYMMETRIC.  One marker step at 5 FPS is ~1.4 rows
+# (0.0097 on the 138x142 canvas), so a climb approaching from below stops on the
+# first sample inside a symmetric band - which parked the character slightly LOW
+# every time (17:24 field log: y_gap=-0.001202 with the old symmetric 0.010, and
+# every earlier stop was negative).  Accepting only 0.005 BELOW but 0.015 ABOVE
+# lets the climb carry past the point into the generous side instead of stopping
+# under it.  ``y`` grows DOWN the minimap, so a negative y_gap = character lower.
+DEAD_FLOWER_Y_ACCEPT_BELOW = 0.005   # how far LOWER than the point is accepted
+DEAD_FLOWER_Y_ACCEPT_ABOVE = 0.015   # how far HIGHER than the point is accepted
 DEAD_FLOWER_X_TOLERANCE = 0.018
-DEAD_FLOWER_Y_TOLERANCE = 0.010
 DEAD_FLOWER_WALK_HOLD_SECONDS = 0.20
 DEAD_FLOWER_DROP_PROGRESS_Y = 0.018
 DEAD_FLOWER_DROP_MAX_ATTEMPTS = 3
-# Two flower points can be only 0.035 Y apart, so their 0.010-Y bands still
-# overlap (0.035 is 5 rows; the accepted window around one point is 0.020 wide).
-# After a Buff changes the target, demand one real 0.003-Y movement in the
-# requested direction before the next point may be considered reached.
+# Two flower points can be only 0.035 Y apart, so their bands still overlap
+# (0.035 is 5 rows; the accepted window around one point is 0.020 wide even
+# after the asymmetry).  After a Buff changes the target, demand one real
+# 0.003-Y movement in the requested direction before the next point counts as
+# reached.
 DEAD_FLOWER_NEXT_POINT_PROGRESS_Y = 0.003
+
+
+def dead_flower_y_accepted(y_gap: float) -> bool:
+    """Whether ``y_gap = target.y - player.y`` is inside the flower Y band.
+
+    Asymmetric on purpose: 0.005 of "still lower" and 0.015 of "already higher"
+    (see the constants above).  ``y`` grows DOWN the minimap, so a negative gap
+    means the character sits LOWER than the recorded flower point.
+    """
+
+    try:
+        gap = float(y_gap)
+    except (TypeError, ValueError):
+        return False
+    return -DEAD_FLOWER_Y_ACCEPT_BELOW <= gap <= DEAD_FLOWER_Y_ACCEPT_ABOVE
 
 
 # Stall recovery is only valid at the rope itself.  Keeping this threshold in
@@ -218,6 +236,18 @@ RESCUE_STALL_PROBE_FRAME_SECONDS = 0.20
 # minimap diamond advances in ~0.005 steps, so a single frame rarely reaches this:
 # it is the accumulated travel from the run's anchor that has to.
 RESCUE_STUCK_STEP_TOLERANCE = 0.02
+# Off-route progress is judged on X plus a MONOTONE vertical run.  A character
+# climbing to the next layer advances in one direction (about 0.01 per frame), so
+# four frames of the same sign are progress; a character hanging on a rope swings
+# 0.04-0.07 back and forth (17:48 field log: 0.097938 <-> 0.170103) and the sign
+# flips every frame, which restarts this run and correctly counts as "no progress".
+OFF_ROUTE_MONOTONE_PROGRESS = 0.04
+# A monotone run only counts after this many steps of the same sign, so one big
+# bob step can never be mistaken for climbing.
+OFF_ROUTE_MONOTONE_STREAK = 3
+# Per-frame step this small is noise; above it the sign of the movement is
+# recorded (about half a marker row).
+OFF_ROUTE_STEP_EPSILON = 0.004
 # After a rescue probe proves that the character CAN move (a fight keeps it still,
 # it was not stuck), the stall check stays quiet for this long.  Without the pause
 # a stationary fight tripped the probe every two seconds, and each probe blocks the
@@ -509,8 +539,23 @@ RECONNECT_DROP_EDGE_WALK_ENABLED = True
 # stall count so a multi-floor descent keeps going, and a run of stalls - or too
 # many attempts/edge cycles - ends the recovery instead of hopping forever.
 UNRESOLVED_FLOOR_DROP_FRAMES = 4
+# Consecutive *descending* frames that mean "a fall is in flight".  Only a
+# monotone descent counts: a character bouncing on a rope moves one marker row
+# on almost every frame, and treating any movement as a fall kept the settled
+# counter at zero forever (16:01 field log: y oscillated 0.097938 <-> 0.170103
+# for six seconds and not one chord was sent).
+UNRESOLVED_FLOOR_SWEEP_FRAMES = 3
 UNRESOLVED_DROP_STALLED_ATTEMPTS = 2
 UNRESOLVED_EDGE_HOLD_SECONDS = 5.0
+# A Direction+Down hold only proves "there is a drop here" when the marker stays
+# down for several samples: a character bouncing on a rope swings its marker by
+# 4-10 rows, and a single sample below the start was enough to cancel every hold
+# after ~0.2 s (17:48 field log).
+UNRESOLVED_EDGE_DESCENT_FRAMES = 3
+# The ladder is bounded (UNRESOLVED_DROP_MAX_ATTEMPTS chords); abandoning it must
+# not be permanent, or a character that never descends sits on that spot for ever
+# ("action=wait (left-most reached or crossed)" in the same log).
+UNRESOLVED_DROP_RETRY_COOLDOWN_SECONDS = 30.0
 UNRESOLVED_DROP_MAX_EDGE_CYCLES = 3
 UNRESOLVED_DROP_MAX_ATTEMPTS = 12
 
@@ -925,7 +970,7 @@ RUNTIME_SUPPORTER_KEY = "_runtime_supporter"
 def _layer_point_ys(layer: Any) -> list[float]:
     """Every recorded Y that makes this layer's detection envelope.
 
-    Route endpoints (left / rope / right), every support point, and the
+    Route endpoints (left / rope / right), every rest/support point, and the
     session's temporary 站桩 row.  Support points are the operator's way of
     saying "this row is still this floor" for a ditch, a bench or the stair row
     a jump lands on (the UI labels them 低 / 高 when they extend the envelope and
@@ -940,6 +985,14 @@ def _layer_point_ys(layer: Any) -> list[float]:
         if isinstance(point, dict) and "y" in point:
             values.append(float(point["y"]))
     if isinstance(layer, dict):
+        rest_points = layer.get("rest_points")
+        if isinstance(rest_points, list):
+            for point in rest_points:
+                if isinstance(point, dict) and "y" in point:
+                    try:
+                        values.append(float(point["y"]))
+                    except (TypeError, ValueError):
+                        continue
         supports = layer.get("support_points")
         if isinstance(supports, list):
             for point in supports:
@@ -973,19 +1026,11 @@ LAYER_UP_REACH_FACTOR = 0.7
 # end, lets try").  The band is now a real tolerance around the recorded rows
 # rather than a hairline: 0.02 is 1.9-2.9 marker rows depending on the
 # minimap height (0.006944 at 144 px ... 0.010417 at 96 px), so a marker drawn a
-# row high or a row low on the floor the character is actually standing on still
-# resolves to that floor.  Under the previous asymmetric hairline
-# (0.003 up / 0.0015 down, 0.34 / 0.17 of a row) both readings were REFUSED,
-# which is what made 开始巡逻 fail with "不属于任何已录制楼层" while the
-# character stood on the recorded row.
-#
-# Measured against the operator's 12 saved recordings: adjacent floors are
-# >= 0.035 apart (红庭2 4.00 rows), so 0.02 + 0.02 = 0.04 stays clear of every
-# pair except 红庭2 (0.004912 shared, 0.56 of a row); 皇冠_牧师 is next at
-# 0.041440 and stays clear by 0.24 rows.  Kept identical to
-# ``patrol_control.LAYER_BAND_UPPER_EDGE_REACH`` / ``..._LOWER_EDGE_REACH``.
-LAYER_BAND_UPPER_EDGE_REACH = 0.02
-LAYER_BAND_LOWER_EDGE_REACH = 0.02
+# Legacy/fallback bands use +/- 0.030.  Persisted bands are rebuilt by
+# PatrolController, which applies the narrower 0.015 paired edge around a
+# Ctrl+End up-jump and its immediately higher recorded layer.
+LAYER_BAND_UPPER_EDGE_REACH = 0.03
+LAYER_BAND_LOWER_EDGE_REACH = 0.03
 
 # Last-resort gap for a single-supporter layer (or a ``layer_y``-only layer)
 # whose recording carries no layout at all, so one marker row cannot be derived.
@@ -1420,6 +1465,12 @@ DROP_ROPE_ESCAPE_WINDOW_SECONDS = 1.2
 # rope attachment.
 DROP_ROPE_ESCAPE_EDGE_MAX_Y_STEP = 0.025
 DROP_ROPE_ESCAPE_EDGE_DIRECTION_PROGRESS_MIN_X = 0.002
+# A single frame that moves FURTHER than the tiny-step window is not proof of a
+# real fall: a character bouncing on a rope swings its marker by 0.04-0.07 (17:48
+# field log: 0.097938 <-> 0.170103), which cleared the whole watch on the first
+# bob and made the escape unreachable.  Only a descent that is larger than any
+# rope bob is treated as "a real drop happened, stop watching".
+DROP_ROPE_ESCAPE_MATERIAL_DESCENT = 0.08
 
 
 def _layer_y_distance(layer: Any, player_y: float) -> Optional[float]:
@@ -3328,12 +3379,29 @@ class MovementWorker(threading.Thread):
             and self._wait_dead_flower_target is not None
             and self._wait_dead_flower_target_layer is not None
         )
+        # 定时休息 follows the same private rope-waypoint approach as 等死花:
+        # target X brings the character to the rope, then target Y ends this
+        # private climb.  It must not wait for the ordinary route to happen to
+        # index the rest layer (that was the failed layer1 sweep in the log).
+        waiting_for_timed_rest = bool(
+            self._timed_rest_preparing
+            and self._timed_rest_target is not None
+            and self._timed_rest_target_layer is not None
+        )
         # A waiting-flower approach is intentionally not a layer arrival.
         # It uses the recorded flower Y only to stop the private rope leg;
         # normal route-layer confirmation remains unchanged everywhere else.
-        if waiting_for_flower:
-            arrival_y = self._wait_dead_flower_target.y
-            arrival_tolerance = DEAD_FLOWER_Y_TOLERANCE
+        if waiting_for_flower or waiting_for_timed_rest:
+            private_target = (
+                self._wait_dead_flower_target
+                if waiting_for_flower else self._timed_rest_target
+            )
+            assert private_target is not None
+            arrival_y = private_target.y
+            # The climb machine keeps Up held inside this band.  It uses the
+            # WIDER (upper) side so it is never stricter than the flower
+            # acceptance itself - the flower step owns the asymmetric decision.
+            arrival_tolerance = DEAD_FLOWER_Y_ACCEPT_ABOVE
         else:
             arrival_y, arrival_tolerance = self._next_layer_arrival_band()
         # 层到达确认已经开始（worker 的图层逻辑正在计数）时，到顶的停滞
@@ -3421,8 +3489,17 @@ class MovementWorker(threading.Thread):
             # a platform, so waiting for two stable layer frames keeps Up held
             # and carries the character straight past it.
             and self._climb_state.phase == "climbing-up"
-            and abs(observation.player.y - self._wait_dead_flower_target.y)
-            <= DEAD_FLOWER_Y_TOLERANCE
+            and dead_flower_y_accepted(
+                self._wait_dead_flower_target.y - observation.player.y
+            )
+        )
+        rest_reached = bool(
+            waiting_for_timed_rest
+            and observation.player is not None
+            and self._climb_state.phase == "climbing-up"
+            and dead_flower_y_accepted(
+                self._timed_rest_target.y - observation.player.y
+            )
         )
         if (result == "succeeded" or flower_reached) and waiting_for_flower:
             self._release_climb_up()
@@ -3443,6 +3520,22 @@ class MovementWorker(threading.Thread):
             LOG.info(
                 "WAIT DEAD FLOWER: flower reached after verified rope attachment; "
                 "released Up without layer-settle confirmation"
+            )
+        elif (result == "succeeded" or rest_reached) and waiting_for_timed_rest:
+            self._release_climb_up()
+            self._climb_state = ClimbState()
+            if self.climbing_active_event is not None:
+                self.climbing_active_event.clear()
+            self._timed_rest_preparing = False
+            self._timed_rest_until = (
+                time.monotonic()
+                + self._timed_rest_delay(self.timed_rest_duration_seconds)
+            )
+            self._release_walk_hold()
+            LOG.info(
+                "TIMED REST: rest point reached after verified rope attachment; "
+                "resting %.1fs",
+                self._timed_rest_until - time.monotonic(),
             )
         elif result == "succeeded" and self._route_layers:
             self._climb_arrival_at = time.monotonic()
@@ -3542,6 +3635,19 @@ class MovementWorker(threading.Thread):
             self._rescue_off_route_frames = 0
             self._rescue_last_pos = None
             return
+        if (not self._unresolved_drop_gave_up
+                and (self._unresolved_drop_attempts > 0
+                     or self._unresolved_edge_phase is not None)):
+            # The unresolved-floor recovery is already changing the layer with
+            # its own chords, so a rescue here only fights that sequence: each
+            # rescue walks Left/Right (blocking attacks) and jumps, and its
+            # stall probe restarts the episode.  Let the Alt+Down /
+            # Direction+Down ladder finish; once it gives up
+            # (``_unresolved_drop_gave_up``) ordinary stuck detection resumes.
+            self._rescue_stuck_frames = 0
+            self._rescue_off_route_frames = 0
+            self._rescue_last_pos = None
+            return
         if self._rest_remaining() > 0:
             # A scheduled rest stands still on purpose; counting its frames
             # would launch a false rescue in the middle of a break.
@@ -3636,6 +3742,25 @@ class MovementWorker(threading.Thread):
             self._rescue_off_route_frames = 0
             self._rescue_last_pos = None
             return
+        if self._skill_cast_in_flight():
+            # A recorded skill point freezes horizontal movement for its cast
+            # (~0.55 s).  Those frames must neither COUNT (18:42 field log: ten
+            # "stationary" frames during a C cast probed Left/Right against the
+            # arbiter's own motion, declared the character stuck on a rope and
+            # jumped it off layer2) nor RESET the run (resetting pushed the
+            # honest 10-frame / 2 s detection out to ~5 s, because a cast frame
+            # used to fall through to the X-and-Y block below, whose Y test the
+            # minimap row snapping never satisfies).  Freeze the counter and the
+            # anchor: once the cast is over and the character really walks, the
+            # next comparison sees |dx| >= 0.02 and clears the run as usual.
+            if not self._rescue_paused_frames_logged:
+                self._rescue_paused_frames_logged = True
+                LOG.info(
+                    "SELF-RESCUE: stall counter paused for a skill cast "
+                    "(frames held at %d/%d)",
+                    self._rescue_stuck_frames, self.rescue_stuck_frames,
+                )
+            return
         vertical_motion = bool(
             self._movement_busy_now()                 # rope climb / stair worker
             or self._return_mode is not None           # climb back to the route
@@ -3663,6 +3788,7 @@ class MovementWorker(threading.Thread):
             # The anchor stays put for the whole no-progress run: minimap X
             # advances in ~0.005 steps, so adjacent-frame comparison alone would
             # read a slow walk as frozen, while the accumulated travel does not.
+            self._rescue_paused_frames_logged = False
             self._rescue_stuck_frames += 1
             self._rescue_max_stuck = max(
                 self._rescue_max_stuck, self._rescue_stuck_frames
@@ -3717,11 +3843,47 @@ class MovementWorker(threading.Thread):
             # consecutive AND the marker remains stationary. Visible X/Y
             # progress means the patrol is still working and must not drop.
             anchor = self._rescue_off_route_anchor
-            if (anchor is None
-                    or abs(pos.x - anchor.x) >= RESCUE_STUCK_STEP_TOLERANCE
-                    or abs(pos.y - anchor.y) >= RESCUE_STUCK_STEP_TOLERANCE):
+            # Vertical movement only counts as progress while it is MONOTONE.
+            # A character climbing to the next layer moves one direction every
+            # frame; one hanging on a rope swings back and forth over the same two
+            # plateaus (17:48 field log: 0.097938 <-> 0.170103), and that reversal
+            # must not keep resetting the run - it is the "stuck on the rope"
+            # signature.  A plain |delta| test cannot tell them apart, and the wide
+            # 0.12 threshold that replaced it broke NORMAL patrols: a slow climb
+            # (about 0.01 per frame) never reset the anchor, so the destructive
+            # "drop to layer1" rescue fired on the way up and the character could
+            # not reach the layer at all.
+            moved_x = bool(
+                anchor is None
+                or abs(pos.x - anchor.x) >= RESCUE_STUCK_STEP_TOLERANCE
+            )
+            delta_y = (
+                0.0 if self._rescue_off_route_last_y is None
+                else pos.y - self._rescue_off_route_last_y
+            )
+            self._rescue_off_route_last_y = pos.y
+            if abs(delta_y) >= OFF_ROUTE_STEP_EPSILON:
+                sign = 1 if delta_y > 0.0 else -1
+                if self._rescue_off_route_trend == sign:
+                    self._rescue_off_route_travel += abs(delta_y)
+                    self._rescue_off_route_streak += 1
+                else:
+                    # Direction reversed (a rope bob): the run starts over and the
+                    # reversal itself contributes nothing, otherwise one 0.04 bob
+                    # step would satisfy the progress threshold on its own.
+                    self._rescue_off_route_trend = sign
+                    self._rescue_off_route_travel = 0.0
+                    self._rescue_off_route_streak = 1
+            monotone_progress = bool(
+                self._rescue_off_route_travel >= OFF_ROUTE_MONOTONE_PROGRESS
+                and self._rescue_off_route_streak >= OFF_ROUTE_MONOTONE_STREAK
+            )
+            if moved_x or monotone_progress:
                 self._rescue_off_route_anchor = Point(pos.x, pos.y)
                 self._rescue_off_route_frames = 1
+                self._rescue_off_route_travel = 0.0
+                self._rescue_off_route_trend = None
+                self._rescue_off_route_streak = 0
             else:
                 self._rescue_off_route_frames += 1
             self._rescue_stuck_frames = 0
@@ -3740,10 +3902,29 @@ class MovementWorker(threading.Thread):
             return
         self._rescue_off_route_frames = 0
         self._rescue_off_route_anchor = None
+        self._rescue_off_route_last_y = None
+        self._rescue_off_route_trend = None
+        self._rescue_off_route_travel = 0.0
+        self._rescue_off_route_streak = 0
+        if vertical_motion:
+            # A climb, a drop, a stair action or a cast owns the marker: X stays
+            # put there BY DESIGN, so counting frames here is how a normal climb
+            # to the next layer got interrupted ("it stops before actually
+            # reaching the layer").  Only the idle/wait frames may count.
+            self._rescue_stuck_frames = 0
+            self._rescue_last_pos = None
+            return
         last = self._rescue_last_pos
+        # X ONLY, exactly like the horizontal-leg branch above.  Requiring the Y to
+        # be still as well made this path inert: the marker of a character on a
+        # rope (or standing on a platform whose rows quantise) snaps 2-10 rows
+        # between frames, so the run never accumulated and the character sat at
+        # "action=wait" for ever after the unresolved ladder gave up (17:48 field
+        # log).  A cast is already excluded by the pause in
+        # ``_skill_cast_in_flight`` above, so an animation cannot fake a stall here.
         if (last is not None
-                and abs(pos.x - last.x) < RESCUE_STUCK_STEP_TOLERANCE
-                and abs(pos.y - last.y) < RESCUE_STUCK_STEP_TOLERANCE):
+                and abs(pos.x - last.x) < RESCUE_STUCK_STEP_TOLERANCE):
+            self._rescue_paused_frames_logged = False
             self._rescue_stuck_frames += 1
             self._rescue_max_stuck = max(
                 self._rescue_max_stuck, self._rescue_stuck_frames
@@ -4001,16 +4182,20 @@ class MovementWorker(threading.Thread):
         after_player = getattr(after, "player", None) if after is not None else None
         moved = bool(
             after_player is not None
-            and (
-                abs(float(after_player.x) - before_x) >= self.rescue_probe_move_threshold
-                or abs(float(after_player.y) - before_y) >= self.rescue_probe_move_threshold
-            )
+            and abs(float(after_player.x) - before_x) >= self.rescue_probe_move_threshold
+        )
+        delta_x = (
+            float(after_player.x) - before_x if after_player is not None else 0.0
+        )
+        delta_y = (
+            float(after_player.y) - before_y if after_player is not None else 0.0
         )
         LOG.warning(
             "SELF-RESCUE jump toward the next target: character was stalled on "
-            "both directions (on a rope); sent %s+%s (%s) and the marker %s",
+            "both directions (on a rope); sent %s+%s (%s) and the marker %s "
+            "(dx=%+.4f dy=%+.4f; only X counts, a rope bob is not a move)",
             direction, self._jump_up_chord_label, direction_reason,
-            "moved" if moved else "did not move",
+            "moved" if moved else "did not move", delta_x, delta_y,
         )
         return True
 
@@ -4023,6 +4208,15 @@ class MovementWorker(threading.Thread):
         bottom floor is a poor guess when the character is hanging one row
         above the next one up (the 21:50 log re-armed layer1 while the
         character was at layer2's height).
+
+        The guess is bounded by the same allowance the layer resolver uses
+        (``LAYER_NEAREST_FLOOR_MAX_DISTANCE``).  Without that bound ANY band
+        answered, so "this marker matches no floor at all" was silently turned
+        into a floor - and the patrol re-armed on it reset the unresolved-floor
+        recovery, which then never got to send its Alt+Down (14:50 field log:
+        y=0.170103, 0.3821 away from layer1, "self-rescue complete on layer1"
+        every three seconds while no chord was ever sent).  Returning ``None``
+        here keeps the floor unresolved, which is the truth.
         """
 
         obs = observation if observation is not None else self.last_observation
@@ -4047,6 +4241,14 @@ class MovementWorker(threading.Thread):
             if best is None or gap < best[1]:
                 best = (name, gap)
         if best is None:
+            return None
+        if best[1] > LAYER_NEAREST_FLOOR_MAX_DISTANCE:
+            LOG.info(
+                "SELF-RESCUE: the landing matches no recorded band and the "
+                "nearest one (%s) is %.4f away at y=%.6f (maximum %.4f); "
+                "leaving the floor unresolved",
+                best[0], best[1], marker_y, LAYER_NEAREST_FLOOR_MAX_DISTANCE,
+            )
             return None
         LOG.info(
             "SELF-RESCUE: the landing matches no recorded band; the nearest "
@@ -4113,6 +4315,9 @@ class MovementWorker(threading.Thread):
             Alt+Up forever at a rope it cannot grab.
           * Otherwise (marker missing / floor unknown): the guarded physical
             descent to the bottom floor re-establishes a known state.
+          * Landing on no recorded floor at all: re-arm NOTHING.  The layer
+            stays unresolved and the Alt+Down recovery (which spent its stall
+            probe to start this rescue) sends its chords next.
         """
         give_up = False
         try:
@@ -4228,23 +4433,41 @@ class MovementWorker(threading.Thread):
                 # bottom recorded floor and let the return/climb detection take
                 # over instead of dropping deeper.
                 self._rescue_cycles = 0
-                fallback_floor = (
-                    self._nearest_recorded_floor(self.last_observation)
-                    or self._bottom_recorded_layer()
-                )
-                if fallback_floor is None:
+                if floor is None:
+                    # The jump landed somewhere no recorded floor describes.
+                    # Do NOT invent one: re-arming the patrol from a guessed
+                    # floor restarts `prepare_patrol_start`, whose reset wipes
+                    # the unresolved-floor recovery (`_unresolved_drop_attempts`
+                    # back to 0, stall probe re-armed) - so the episode ended in
+                    # "self-rescue complete on layer1" every few seconds and the
+                    # operator's Alt+Down -> Alt+Down -> left/right+Down sequence
+                    # never ran once (14:50 field log).  Leaving the floor
+                    # unresolved hands the next frame to that recovery, whose
+                    # stall probe is already spent, so it sends its first
+                    # Alt+Down chord.
                     LOG.warning(
-                        "SELF-RESCUE: a confirmed stall is never answered with "
-                        "Alt+Down; no recorded floor to re-arm on, leaving "
-                        "patrol as it is"
+                        "SELF-RESCUE: the jump landed on no recorded floor; "
+                        "leaving the layer unresolved so the Alt+Down recovery "
+                        "owns it (no re-arm, no guessed floor)"
                     )
                 else:
-                    LOG.warning(
-                        "SELF-RESCUE: re-arming patrol from %s in place after "
-                        "the stall jump (no drop from a confirmed stall)",
-                        fallback_floor,
+                    fallback_floor = (
+                        self._nearest_recorded_floor(self.last_observation)
+                        or self._bottom_recorded_layer()
                     )
-                    self._restart_patrol_from_first_layer(fallback_floor)
+                    if fallback_floor is None:
+                        LOG.warning(
+                            "SELF-RESCUE: a confirmed stall is never answered with "
+                            "Alt+Down; no recorded floor to re-arm on, leaving "
+                            "patrol as it is"
+                        )
+                    else:
+                        LOG.warning(
+                            "SELF-RESCUE: re-arming patrol from %s in place after "
+                            "the stall jump (no drop from a confirmed stall)",
+                            fallback_floor,
+                        )
+                        self._restart_patrol_from_first_layer(fallback_floor)
         except Exception:
             LOG.exception("self-rescue failed")
         finally:
@@ -4385,6 +4608,23 @@ class MovementWorker(threading.Thread):
         self._rope_stuck_recoveries += 1
         LOG.warning("ROPE STUCK recovery #%d: character on the rope; "
                     "climbing up (Z paused)", self._rope_stuck_recoveries)
+
+    def _skill_cast_in_flight(self) -> bool:
+        """True only while a recorded SKILL point's tap owns the keyboard.
+
+        Deliberately narrower than :meth:`_movement_busy_now`: a drop, a climb,
+        a stair action or a buff token is NOT a cast.  The stall detector treats
+        those as "vertical motion" (counters reset), while a cast only *pauses*
+        the counter - see ``_rescue_stuck_check``.
+        """
+
+        # The worker-side token set is written under ``_skill_delivery_lock``; a
+        # plain truth test on it is atomic.  The arbiter's own view is consulted
+        # too so a token the arbiter already dropped cannot pin this on.
+        if self._skill_pending_tokens:
+            return True
+        skill_motion_active = getattr(self.motion_arbiter, "skill_motion_active", None)
+        return bool(callable(skill_motion_active) and skill_motion_active())
 
     def _movement_busy_now(self) -> bool:
         """True while vertical recovery, a stair action or a skill cast is active.
@@ -4787,7 +5027,15 @@ class MovementWorker(threading.Thread):
                         # a successful endpoint turn.
                         force_key_up = getattr(self.key_sender, "force_key_up", None)
                         key_up_old = getattr(self.key_sender, "key_up", None)
-                        if callable(force_key_up):
+                        if self._edge_chord_owns(previous):
+                            # Same rule as the endpoint turn: the layer recovery's
+                            # Direction+Down chord must survive a patrol direction
+                            # switch.
+                            LOG.info(
+                                "walk direction switch deferred: the layer recovery "
+                                "owns %s+Down", previous,
+                            )
+                        elif callable(force_key_up):
                             force_key_up(previous, reason="walk direction switch")
                         elif key_up_old is not None:
                             key_up_old(previous)
@@ -5217,6 +5465,10 @@ class MovementWorker(threading.Thread):
         self.stationary_recovery_active_event = stationary_recovery_active_event
         self.stationary_attack_resume_event = stationary_attack_resume_event
         self._stationary_attack_was_blocked = False
+        # 空打 is a shared EXP-progress safety gate.  StatusWorker toggles it
+        # asynchronously; the movement thread performs all key releases on
+        # its own frame so it never races the keyboard ownership ledger.
+        self.exp_stall_paused = False
         self.dropping_active_event = dropping_active_event
         self.near_rope_event = near_rope_event
         self.important_positions = important_positions or {}
@@ -5605,6 +5857,18 @@ class MovementWorker(threading.Thread):
         self._wait_dead_flower_leave_started_at: Optional[float] = None
         self._wait_dead_flower_leave_attempts = 0
         self._wait_dead_flower_leave_retry_at = 0.0
+        self.timed_rest_enabled = False
+        self.timed_rest_interval_seconds = 3600.0
+        self.timed_rest_duration_seconds = 300.0
+        self._timed_rest_next_at = float("inf")
+        self._timed_rest_until = 0.0
+        self._timed_rest_preparing = False
+        self._timed_rest_target: Optional[Point] = None
+        self._timed_rest_target_layer: Optional[str] = None
+        self._timed_rest_leaving = False
+        self._timed_rest_leave_started_at: Optional[float] = None
+        self._timed_rest_leave_attempts = 0
+        self._timed_rest_leave_retry_at = 0.0
         # UI-only association of the temporary standing point with an
         # existing recorded layer.  It remains visible even when the route
         # configuration is not sufficient to arm a return.
@@ -5742,6 +6006,9 @@ class MovementWorker(threading.Thread):
         self._rescue_last_pos: Optional[Point] = None
         self._rescue_stuck_frames = 0
         self._rescue_max_stuck = 0
+        # One line per pause episode: a skill cast freezes the counter without
+        # counting or resetting it (see _rescue_stuck_check).
+        self._rescue_paused_frames_logged = False
         # A probe that proved the character can move pauses the detector for
         # RESCUE_PROBE_BACKOFF_SECONDS (see _rescue_stuck_check).
         self._rescue_suppressed_until = 0.0
@@ -5750,6 +6017,12 @@ class MovementWorker(threading.Thread):
         # frames and launch the destructive Alt+Down rescue.
         self._rescue_off_route_frames = 0
         self._rescue_off_route_anchor: Optional[Point] = None
+        # Monotone-run bookkeeping for the off-route detector: a climbing character
+        # advances in one direction, a rope bob reverses every frame.
+        self._rescue_off_route_last_y: Optional[float] = None
+        self._rescue_off_route_trend: Optional[int] = None
+        self._rescue_off_route_travel = 0.0
+        self._rescue_off_route_streak = 0
         self._rescue_active = False
         # 随机休息: while this deadline is in the future the worker emits no
         # movement input and holds the attack workers off.  It is deliberately
@@ -5952,6 +6225,7 @@ class MovementWorker(threading.Thread):
         # floor while standing, and the Alt+Down attempt bookkeeping that changes
         # the layer instead of walking a floor nobody recorded.
         self._unresolved_floor_settled_frames = 0
+        self._unresolved_floor_sweep_frames = 0
         self._unresolved_floor_last_y: Optional[float] = None
         self._unresolved_drop_attempts = 0
         # One Left/Right stall probe runs before the first Alt+Down of an
@@ -5961,10 +6235,12 @@ class MovementWorker(threading.Thread):
         self._unresolved_drop_attempt_y: Optional[float] = None
         self._unresolved_drop_attempt_at: Optional[float] = None
         self._unresolved_drop_gave_up = False
+        self._unresolved_drop_gave_up_at = 0.0
         self._unresolved_edge_phase: Optional[str] = None
         self._unresolved_edge_second_pass = False
         self._unresolved_edge_started_at = 0.0
         self._unresolved_edge_start_y: Optional[float] = None
+        self._unresolved_edge_descent_frames = 0
         self._unresolved_edge_cycles = 0
         self._unresolved_blocked_reason: Optional[str] = None
         # The scroll-compensated world-Y value is an offset from an origin the
@@ -7950,19 +8226,25 @@ class MovementWorker(threading.Thread):
             LOG.warning("RECONNECT DROP RECOVERY: edge input suppressed; game window is not ready")
             return False
         key_down_chord = getattr(self.key_sender, "key_down_chord", None)
-        key_down = getattr(self.key_sender, "key_down", None)
-        direction_claimed = down_claimed = False
+        if not callable(key_down_chord):
+            # NEVER press the direction alone as a fallback.  A split chord is
+            # exactly what the operator saw as "left, then down": the direction
+            # goes down first, the next decision releases it, and the Alt+Down
+            # drop then arrives without it.  No chord, no hold.
+            LOG.warning(
+                "DROP EDGE RECOVERY (%s): the sender cannot emit a "
+                "Direction+Down chord in one packet; no edge hold started",
+                source,
+            )
+            return False
         with self._direction_lock:
-            if callable(key_down_chord):
-                claimed = key_down_chord(direction, "down")
-                direction_claimed = down_claimed = claimed is not False
-            elif callable(key_down):
-                direction_claimed = key_down(direction) is not False
-                down_claimed = key_down("down") is not False
-        if not (direction_claimed and down_claimed):
-            if direction_claimed or down_claimed:
-                self._reconnect_drop_edge_input_direction = direction
-                self._release_reconnect_drop_edge_input(reason="partial edge chord")
+            claimed = key_down_chord(direction, "down")
+        if claimed is False:
+            LOG.warning(
+                "DROP EDGE RECOVERY (%s): the %s+Down chord was refused; "
+                "retrying on the next frame instead of splitting it",
+                source, direction,
+            )
             return False
         self._reconnect_drop_edge_input_direction = direction
         self._reconnect_drop_edge_input_until = now + max(0.05, float(duration))
@@ -8023,14 +8305,23 @@ class MovementWorker(threading.Thread):
         tiny_rope_progress = bool(
             DROP_ROPE_ESCAPE_MIN_Y_STEP <= delta_y <= max_y_step
             and abs(delta_x) <= DROP_ROPE_ESCAPE_MAX_X_DRIFT
-            and (expected_direction is None
-                 or self._drop_rope_escape_saw_direction_progress)
+            # Deliberately NOT gated on ``saw_direction_progress`` any more.  On a
+            # rope the marker's X cannot move at all, so demanding an observed
+            # direction step made the escape unreachable exactly when it is needed:
+            # the second descent of the 17:48 field log held right+Down for the
+            # whole 5 s window with X frozen at 0.368571, produced no descent and
+            # no escape, and the character stayed on the rope.  The watch is only
+            # armed right after a downward input, so "static X + a tiny Y rise" is
+            # the rope signature whether or not the direction could move.
         )
         self._drop_rope_escape_last_position = current
         if not tiny_rope_progress:
-            # A material downward movement is normal drop evidence.  Do not
-            # leave a stale watch armed for a later, unrelated rope approach.
-            if delta_y > max_y_step:
+            # A MATERIAL descent is normal drop evidence: stop watching so a later
+            # frame cannot be mistaken for a rope attachment.  The threshold is
+            # deliberately larger than any rope bob - using the tiny-step limit
+            # here (0.012 / 0.025) cleared the watch on the first bob frame, which
+            # is why the escape never fired for a character glued to the rope.
+            if delta_y > DROP_ROPE_ESCAPE_MATERIAL_DESCENT:
                 self._clear_drop_rope_escape_watch()
             else:
                 self._drop_rope_escape_tiny_rise_frames = 0
@@ -10715,6 +11006,51 @@ class MovementWorker(threading.Thread):
             )
         return target
 
+    def set_exp_stall_paused(self, paused: bool) -> None:
+        """Pause/resume route input for the EXP-based 空打 safety gate.
+
+        The status worker only flips this flag.  Releasing keys is intentionally
+        deferred to the movement thread's next capture frame so one thread owns
+        the movement state and keyboard ledger.
+        """
+
+        paused = bool(paused)
+        if paused == self.exp_stall_paused:
+            return
+        self.exp_stall_paused = paused
+        LOG.warning(
+            "EMPTY ATTACK: movement %s until EXP %s",
+            "paused" if paused else "resumed",
+            "changes again" if paused else "is observed changing",
+        )
+
+    def _service_exp_stall_pause(self) -> bool:
+        """Release movement-owned input and hold the current route state."""
+
+        if not self.exp_stall_paused:
+            return False
+        self._release_reconnect_drop_edge_input(reason="empty attack EXP pause")
+        self._clear_drop_rope_escape_watch()
+        self._release_walk_hold()
+        self._release_climb_up()
+        if self._jump_point_up_held:
+            force_key_up = getattr(self.key_sender, "force_key_up", None)
+            key_up = getattr(self.key_sender, "key_up", None)
+            if callable(force_key_up):
+                force_key_up("up", reason="empty attack EXP pause")
+            elif callable(key_up):
+                key_up("up")
+            self._forget_up_claims()
+        self._clear_jump_up_session()
+        # A later EXP change should re-plan from the live marker rather than
+        # resume a half-completed rope state whose Up claim was just released.
+        if self._climb_state.phase != "idle":
+            self._climb_state = ClimbState()
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.clear()
+        self.last_decision = MovementDecision(None, "empty attack: EXP unchanged")
+        return True
+
     def set_stationary_attack_enabled(self, enabled: bool) -> None:
         """Select 站桩攻击, which is independent of recorded route data."""
 
@@ -10799,6 +11135,39 @@ class MovementWorker(threading.Thread):
         if had_anchor:
             LOG.info("STATIONARY ATTACK: temporary anchor cleared (%s)", reason)
 
+    def recovery_owns_layer(self) -> bool:
+        """True only while 未解析楼层 is changing layer during a normal patrol.
+
+        The operator's rule (2026-11-18): pause attacking ONLY when the layer is
+        unresolved AND the client is trying to get back to a normal floor - never
+        for a mode that owns its own vertical input.  The reason is mechanical:
+        the Alt+Down and Direction+Down chords share the Alt key with the 跳打
+        beat, and a beat in the middle of a 5 s hold cancels it (17:48 field log:
+        attacks ran between every chord).
+
+        站桩攻击 (including its 定时巡逻 stage) keeps attacking: it stands on its
+        own temporary anchor, its displacement recovery already owns the vertical
+        state, and the ladder is gated off for it anyway (``_unresolved_drop_blocker``).
+        """
+
+        # A timed rest deliberately pauses attacks while its private rope leg
+        # approaches, holds at, or leaves a recorded 休 point.  No other
+        # movement recovery is allowed to compete for those inputs.
+        if (
+            self._timed_rest_preparing
+            or time.monotonic() < self._timed_rest_until
+            or self._timed_rest_leaving
+        ):
+            return True
+        if self._unresolved_drop_gave_up:
+            return False
+        if not (self._unresolved_drop_attempts > 0
+                or self._unresolved_edge_phase is not None):
+            return False
+        if bool(getattr(self, "stationary_attack_enabled", False)):
+            return False
+        return True
+
     def flower_patrol_attack_allowed(self) -> bool:
         """Whether 跑花模式 may send a cadence attack right now.
 
@@ -10808,7 +11177,10 @@ class MovementWorker(threading.Thread):
         an in-between climb frame.
         """
 
-        return self._confirmed_attack_layer == "layer1"
+        return (
+            self._confirmed_attack_layer == "layer1"
+            and not self.recovery_owns_layer()
+        )
 
     def set_flower_patrol_mode(self, enabled: bool) -> None:
         """Toggle layer1-only combat without changing patrol movement."""
@@ -11055,6 +11427,211 @@ class MovementWorker(threading.Thread):
             0.0, self.wait_dead_flower_jitter_seconds,
         )
 
+    def set_timed_rest_schedule(
+        self, enabled: bool, interval_seconds: float, duration_seconds: float,
+    ) -> None:
+        """Configure the independent 定时休息 schedule.
+
+        The actual interval and rest use a one-sided 0–5% draw, so 100 minutes
+        means 100–105 minutes.  Debug mode may supply second-scale values.
+        """
+        enabled = bool(enabled)
+        interval_seconds = max(1.0, float(interval_seconds))
+        duration_seconds = max(1.0, float(duration_seconds))
+        unchanged = (
+            enabled == self.timed_rest_enabled
+            and abs(interval_seconds - self.timed_rest_interval_seconds) < 1e-6
+            and abs(duration_seconds - self.timed_rest_duration_seconds) < 1e-6
+        )
+        # This setter is reached by every fixed-panel save.  Re-arming an
+        # unchanged schedule here made a one-minute timer perpetually start
+        # over whenever another control refreshed.
+        if unchanged:
+            return
+
+        # A panel refresh can save a rounded debug value while this private
+        # route is already climbing to, waiting at, or leaving its 休 point.
+        # Preserve that live ownership.  Otherwise the reset below hands the
+        # rope to generic drop-to-route recovery, which repeatedly sends
+        # Alt+Down and causes the gradual descent seen in the field.
+        live_round = bool(
+            self._timed_rest_preparing
+            or self._timed_rest_leaving
+            or self._timed_rest_until > time.monotonic()
+        )
+        if enabled and self.timed_rest_enabled and live_round:
+            self.timed_rest_interval_seconds = interval_seconds
+            self.timed_rest_duration_seconds = duration_seconds
+            LOG.info(
+                "TIMED REST: schedule refreshed during active private leg; "
+                "current rest ownership retained"
+            )
+            return
+        self.timed_rest_enabled = enabled
+        self.timed_rest_interval_seconds = interval_seconds
+        self.timed_rest_duration_seconds = duration_seconds
+        self._timed_rest_preparing = False
+        self._timed_rest_target = None
+        self._timed_rest_target_layer = None
+        self._timed_rest_leaving = False
+        self._timed_rest_leave_started_at = None
+        self._timed_rest_leave_attempts = 0
+        self._timed_rest_leave_retry_at = 0.0
+        self._timed_rest_until = 0.0
+        self._timed_rest_next_at = (
+            time.monotonic() + self._timed_rest_delay(self.timed_rest_interval_seconds)
+            if self.timed_rest_enabled else float("inf")
+        )
+
+    @staticmethod
+    def _timed_rest_delay(base_seconds: float) -> float:
+        return float(base_seconds) * random.uniform(1.0, 1.05)
+
+    def _reset_timed_rest_round(self, now: float) -> None:
+        """Finish one rest round and arm the next wall-clock interval."""
+
+        self._timed_rest_until = 0.0
+        self._timed_rest_preparing = False
+        self._timed_rest_target = None
+        self._timed_rest_target_layer = None
+        self._timed_rest_leaving = False
+        self._timed_rest_leave_started_at = None
+        self._timed_rest_leave_attempts = 0
+        self._timed_rest_leave_retry_at = 0.0
+        self._timed_rest_next_at = now + self._timed_rest_delay(
+            self.timed_rest_interval_seconds
+        )
+
+    def _timed_rest_leave_step(
+        self, observation: MinimapObservation, now: float,
+    ) -> None:
+        """Leave a reached 休 rope with the same bounded jump as 等死花."""
+
+        player = observation.player
+        if player is None:
+            self._reset_timed_rest_round(now)
+            LOG.warning("TIMED REST: marker lost while leaving; normal patrol resumed")
+            return
+        self._release_climb_up()
+        self._release_walk_hold()
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.set()
+        start_y = self._timed_rest_leave_started_at
+        if start_y is not None and player.y >= start_y + DEAD_FLOWER_DROP_PROGRESS_Y:
+            self._finish_timed_rest_round(observation, now, "rope departure confirmed")
+            return
+        if now >= self._timed_rest_leave_retry_at:
+            if self._timed_rest_leave_attempts >= DEAD_FLOWER_DROP_MAX_ATTEMPTS:
+                self._finish_timed_rest_round(observation, now, "rope departure retry limit")
+                return
+            if self.perform_stair_jump("left"):
+                self._timed_rest_leave_attempts += 1
+                self._timed_rest_leave_retry_at = now + self.drop_retry_seconds
+                LOG.info(
+                    "TIMED REST: Alt+Left rope departure %d/%d",
+                    self._timed_rest_leave_attempts, DEAD_FLOWER_DROP_MAX_ATTEMPTS,
+                )
+        self.last_decision = MovementDecision("drop", "timed rest: leaving rope")
+
+    def _finish_timed_rest_round(
+        self, observation: MinimapObservation, now: float, reason: str,
+    ) -> None:
+        """Return the private rest leg to the normal patrol drop cycle."""
+
+        target_layer = self._timed_rest_target_layer
+        self._reset_timed_rest_round(now)
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.clear()
+        if self._route_layers:
+            if target_layer in self._route_layers:
+                self._route_layer_index = self._route_layers.index(target_layer)
+            elif self._route_layer_index is None:
+                self._route_layer_index = len(self._route_layers) - 1
+            self._route_phase = "drop"
+            self._reset_route_completion()
+            LOG.info(
+                "TIMED REST: %s; normal drop starts the next patrol round", reason,
+            )
+        else:
+            LOG.warning("TIMED REST: %s; no normal route to resume", reason)
+
+    def _timed_rest_route(self) -> Optional[tuple[str, Point]]:
+        """Return a saved 休 point on the active route.
+
+        This deliberately mirrors 等死花's private waypoint lookup: a timer
+        belongs to the route, not merely to whichever floor happens to be
+        resolved on its exact deadline.  The normal route owns cross-layer
+        travel; this schedule takes over only after that layer is reached.
+        """
+
+        # Prefer a normal route layer, then accept a 休-only layer.  The latter
+        # is a legal recording shape just like a 花-only layer: its saved Y now
+        # participates in the layer band, so the scheduled state can claim it
+        # during an otherwise ordinary climb/route pass.
+        names = list(self._route_layers)
+        names.extend(
+            name for name in sorted(self.important_positions, key=_layer_number)
+            if name not in self._route_layers
+        )
+        for layer_name in names:
+            layer = self.important_positions.get(layer_name)
+            points = layer.get("rest_points") if isinstance(layer, dict) else None
+            if not isinstance(points, list):
+                continue
+            try:
+                point = next(
+                    Point(float(item["x"]), float(item["y"]))
+                    for item in points if isinstance(item, dict)
+                )
+            except (StopIteration, KeyError, TypeError, ValueError):
+                continue
+            return layer_name, point
+        return None
+
+    def _service_timed_rest_schedule(
+        self, observation: MinimapObservation, now: float,
+    ) -> bool:
+        """Route to a scheduled 休 point, then hold movement and attacks."""
+        if not self.timed_rest_enabled:
+            return False
+        if self._timed_rest_leaving:
+            self._timed_rest_leave_step(observation, now)
+            return True
+        if now < self._timed_rest_until:
+            self._release_climb_up()
+            self._release_walk_hold()
+            self.last_decision = MovementDecision(None, "timed rest")
+            return True
+        if self._timed_rest_until:
+            self._timed_rest_until = 0.0
+            self._timed_rest_leaving = True
+            player = observation.player
+            self._timed_rest_leave_started_at = (
+                float(player.y) if player is not None else None
+            )
+            self._timed_rest_leave_attempts = 0
+            self._timed_rest_leave_retry_at = 0.0
+            LOG.info("TIMED REST: rest finished; leaving rope for next patrol round")
+            self._timed_rest_leave_step(observation, now)
+            return True
+        if now < self._timed_rest_next_at:
+            return False
+        if not self._timed_rest_preparing:
+            route = self._timed_rest_route()
+            if route is None:
+                self._timed_rest_next_at = now + self._timed_rest_delay(self.timed_rest_interval_seconds)
+                LOG.warning("TIMED REST skipped: record a 休 point on a patrol layer")
+                return False
+            layer_name, point = route
+            self._timed_rest_target = point
+            self._timed_rest_target_layer = layer_name
+            self._timed_rest_preparing = True
+            LOG.info("TIMED REST: heading to %s 休 point x=%.6f", layer_name, point.x)
+        # While approaching, ``_route_target_impl`` owns the rope approach and
+        # ``_run_climb_step`` changes this to the actual rest only after a
+        # verified attachment plus target-Y arrival.
+        return False
+
     def _reset_wait_dead_flower_state(self) -> None:
         """Forget one 等死花 approach without touching normal patrol state."""
 
@@ -11150,7 +11727,7 @@ class MovementWorker(threading.Thread):
             return
         if now < self._wait_dead_flower_depart_at:
             y_gap = target.y - player.y
-            if abs(y_gap) > DEAD_FLOWER_Y_TOLERANCE:
+            if not dead_flower_y_accepted(y_gap):
                 direction = "down" if y_gap > 0.0 else "up"
                 if self.climbing_active_event is not None:
                     self.climbing_active_event.set()
@@ -11324,8 +11901,9 @@ class MovementWorker(threading.Thread):
                 # all the way to the next real layer.
                 #
                 # The next 5-FPS Dead Flower tick uses the selected flower's
-                # Y as a *private* virtual support: it either stops within
-                # DEAD_FLOWER_Y_TOLERANCE or holds Up/Down toward that point.
+                # Y as a *private* virtual support: it either stops inside the
+                # asymmetric flower band (0.005 below / 0.015 above, see
+                # DEAD_FLOWER_Y_ACCEPT_*) or holds Up/Down toward that point.
                 # No normal layer band, patrol resolver, or other mode is
                 # modified by this handoff.
                 self._dead_flower_release_vertical()
@@ -11815,7 +12393,7 @@ class MovementWorker(threading.Thread):
         # that started on the rope is already marked attached by its one-time
         # entry classification.
         if (rope_attached_for_flower
-                and abs(y_gap) <= DEAD_FLOWER_Y_TOLERANCE
+                and dead_flower_y_accepted(y_gap)
                 and not requires_progress):
             self._log_dead_flower_analysis(
                 player, target, target_index, len(flowers), "hold", y_gap,
@@ -14154,6 +14732,11 @@ class MovementWorker(threading.Thread):
             time.monotonic() + self._wait_dead_flower_delay()
             if self.wait_dead_flower_enabled else float("inf")
         )
+        # 定时休息 is likewise measured from this patrol start, never from a
+        # panel refresh that happened several seconds before Start Patrol.
+        self._reset_timed_rest_round(time.monotonic())
+        if not self.timed_rest_enabled:
+            self._timed_rest_next_at = float("inf")
 
         if above_route:
             # ``floor`` is the top route layer only as a stable world-Y
@@ -14677,6 +15260,7 @@ class MovementWorker(threading.Thread):
             )
             self._clear_drop_rope_escape_watch()
         self._unresolved_floor_settled_frames = 0
+        self._unresolved_floor_sweep_frames = 0
         self._unresolved_floor_last_y = None
         self._unresolved_drop_attempts = 0
         # A new unresolved-floor episode gets one fresh stall probe before its
@@ -14686,9 +15270,11 @@ class MovementWorker(threading.Thread):
         self._unresolved_drop_attempt_y = None
         self._unresolved_drop_attempt_at = None
         self._unresolved_drop_gave_up = False
+        self._unresolved_drop_gave_up_at = 0.0
         self._unresolved_edge_phase = None
         self._unresolved_edge_second_pass = False
         self._unresolved_edge_started_at = 0.0
+        self._unresolved_edge_descent_frames = 0
         self._unresolved_edge_start_y = None
         self._unresolved_edge_cycles = 0
 
@@ -14721,6 +15307,29 @@ class MovementWorker(threading.Thread):
             self._reset_unresolved_drop_recovery()
             return self._note_unresolved_drop_blocked(blocked)
         self._unresolved_blocked_reason = None
+        if (self._unresolved_drop_gave_up
+                and now - self._unresolved_drop_gave_up_at
+                >= UNRESOLVED_DROP_RETRY_COOLDOWN_SECONDS):
+            # The ladder is bounded (12 chords) but giving up must not be final:
+            # once it abandoned the layer change the marker still matched no
+            # floor, and the character stayed on that spot for ever (17:48 field
+            # log: "stopping the layer change" then endless
+            # "action=wait (left-most reached or crossed)").  Start a fresh budget
+            # after a cooldown; the stall probe stays spent, so the chords begin
+            # immediately.
+            LOG.warning(
+                "UNRESOLVED FLOOR: retrying the layer change after %.0fs "
+                "(the marker still matches no recorded floor)",
+                UNRESOLVED_DROP_RETRY_COOLDOWN_SECONDS,
+            )
+            self._unresolved_drop_gave_up = False
+            self._unresolved_drop_attempts = 0
+            self._unresolved_drop_stalls = 0
+            self._unresolved_edge_phase = None
+            self._unresolved_edge_second_pass = False
+            self._unresolved_edge_cycles = 0
+            self._unresolved_edge_descent_frames = 0
+            self._unresolved_floor_settled_frames = UNRESOLVED_FLOOR_DROP_FRAMES
         y = float(player.y)
         # MARKER evidence only.  The floor is resolved when the marker itself
         # matches a recorded band, or when it is within the nearest-floor
@@ -14751,12 +15360,20 @@ class MovementWorker(threading.Thread):
             return None
         previous = self._unresolved_floor_last_y
         self._unresolved_floor_last_y = y
-        if (previous is not None
-                and abs(y - previous) >= self._fall_marker_y_gain):
-            # Still sweeping (a fall/knock-down in flight): not a standing
-            # position, so this is not the moment to choose a layer by moving.
-            self._unresolved_floor_settled_frames = 0
-            return None
+        if previous is not None and (y - previous) >= self._fall_marker_y_gain:
+            # A marker moving DOWN the minimap is a fall/knock-down in flight:
+            # not a standing position, so this is not the moment to choose a
+            # layer.  Only a monotone run of such frames counts.  The previous
+            # ``abs()`` test answered "falling" for ANY change, and a character
+            # bouncing on a rope moves one row every frame, so the settled
+            # counter was reset continuously and the recovery never sent a
+            # chord (16:01 field log).
+            self._unresolved_floor_sweep_frames += 1
+            if self._unresolved_floor_sweep_frames >= UNRESOLVED_FLOOR_SWEEP_FRAMES:
+                self._unresolved_floor_settled_frames = 0
+                return None
+        else:
+            self._unresolved_floor_sweep_frames = 0
         self._unresolved_floor_settled_frames += 1
         if self._unresolved_floor_settled_frames < UNRESOLVED_FLOOR_DROP_FRAMES:
             return None
@@ -14768,16 +15385,32 @@ class MovementWorker(threading.Thread):
         phase = self._unresolved_edge_phase
         if phase is not None:
             start_y = self._unresolved_edge_start_y
+            # A descent is "this side has somewhere to drop", and it must be
+            # SUSTAINED.  The single-frame test here asked only whether one sample
+            # was one progress-step below the hold's start, and the marker of a
+            # character bouncing on a rope swings 4-10 rows (17:48 field log: the
+            # Y went 0.097938 -> 0.139175 -> 0.170103 and back), so every
+            # right+Down hold was cancelled after ~0.2 s as a "confirmed descent"
+            # - the 5 s hold never ran, left+Down was never tried, and the ladder
+            # burned its whole budget and gave up on the spot.  Require the drop to
+            # hold for UNRESOLVED_EDGE_DESCENT_FRAMES consecutive samples instead.
             if (start_y is not None
                     and y >= start_y + RECONNECT_DROP_Y_PROGRESS):
+                self._unresolved_edge_descent_frames += 1
+            else:
+                self._unresolved_edge_descent_frames = 0
+            if (start_y is not None
+                    and self._unresolved_edge_descent_frames
+                    >= UNRESOLVED_EDGE_DESCENT_FRAMES):
                 LOG.info(
                     "UNRESOLVED FLOOR: Y increased from %.6f to %.6f while "
-                    "moving %s; resuming Alt+Down",
-                    start_y, y, phase,
+                    "moving %s for %d consecutive frames; resuming Alt+Down",
+                    start_y, y, phase, self._unresolved_edge_descent_frames,
                 )
                 self._unresolved_edge_phase = None
                 self._unresolved_edge_second_pass = False
                 self._unresolved_edge_start_y = None
+                self._unresolved_edge_descent_frames = 0
                 self._unresolved_drop_stalls = 0
                 self._release_reconnect_drop_edge_input(
                     reason="unresolved floor descent confirmed"
@@ -14811,6 +15444,7 @@ class MovementWorker(threading.Thread):
                 self._unresolved_edge_second_pass = True
                 self._unresolved_edge_started_at = now
                 self._unresolved_edge_start_y = y
+                self._unresolved_edge_descent_frames = 0
                 LOG.warning(
                     "UNRESOLVED FLOOR: %s+Down edge found no descent; holding "
                     "%s+Down for %.1fs",
@@ -15023,6 +15657,7 @@ class MovementWorker(threading.Thread):
         self._unresolved_edge_second_pass = False
         self._unresolved_edge_started_at = now
         self._unresolved_edge_start_y = y
+        self._unresolved_edge_descent_frames = 0
         self._unresolved_drop_stalls = 0
         LOG.warning(
             "UNRESOLVED FLOOR: %d Alt+Down attempts made no downward progress; "
@@ -15060,6 +15695,7 @@ class MovementWorker(threading.Thread):
 
         if not self._unresolved_drop_gave_up:
             self._unresolved_drop_gave_up = True
+            self._unresolved_drop_gave_up_at = time.monotonic()
             LOG.warning(
                 "UNRESOLVED FLOOR: stopping the layer change (%s); the marker "
                 "still matches no recorded floor, so the normal route/stationary "
@@ -16651,6 +17287,12 @@ class MovementWorker(threading.Thread):
 
         if not self.patrol_enabled:
             return None, False, "patrol-paused"
+        # 定时休息 is a private rope leg.  Once its timer has claimed a 休
+        # point, an older stationary-return or drop-to-route state must not
+        # reclaim the planner and emit Alt+Down.  The private climb resolves
+        # the point itself in ``_run_climb_step`` before normal routing resumes.
+        if self._timed_rest_preparing and self._timed_rest_target is not None:
+            return self._timed_rest_target.x, True, "timed-rest"
         if self.stationary_attack_enabled and not self._stationary_timed_patrol_active:
             if self._stationary_attack_anchor is None:
                 return None, False, "stationary-attack-awaiting-anchor"
@@ -16989,10 +17631,18 @@ class MovementWorker(threading.Thread):
                 continue
             parts = source.get("part_points")
             part = parts.get(str(part_index)) if isinstance(parts, dict) else None
-            if not isinstance(part, dict) or not _layer_present_actions(part):
+            has_rest_point = bool(
+                isinstance(part, dict)
+                and isinstance(part.get("rest_points"), list)
+                and any(isinstance(point, dict) and "x" in point and "y" in point
+                        for point in part["rest_points"])
+            )
+            if not isinstance(part, dict) or (
+                not _layer_present_actions(part) and not has_rest_point
+            ):
                 continue
             layer = dict(source)
-            for key in ("left_most_pos", "right_most_pos", "rope_pos", "jump_points", "skill_points"):
+            for key in ("left_most_pos", "right_most_pos", "rope_pos", "jump_points", "skill_points", "rest_points"):
                 layer.pop(key, None)
             layer.update(part)
             materialized[name] = layer
@@ -17312,6 +17962,17 @@ class MovementWorker(threading.Thread):
 
         if previous not in ("left", "right"):
             return
+        if self._edge_chord_owns(previous):
+            # The unresolved-floor recovery is running its Direction+Down ladder
+            # and owns this direction.  Turning the patrol over now would press
+            # the opposite key (the sender's direction switch force-releases the
+            # old one) and break the chord.  The route recomputes from the marker
+            # on the frame after the ladder ends, so nothing is lost by deferring.
+            LOG.info(
+                "endpoint turn deferred: the layer recovery owns %s+Down",
+                previous,
+            )
+            return
         if next_direction not in ("left", "right"):
             # The next phase has no horizontal direction of its own (rope, up
             # jump point, stand): the walking frame computes one, so there is no
@@ -17362,11 +18023,37 @@ class MovementWorker(threading.Thread):
             next_direction,
         )
 
+    def _edge_chord_owns(self, key: str) -> bool:
+        """True while the Direction+Down edge chord owns the walk direction ``key``.
+
+        The chord is the recovery's own input: an ordinary patrol direction
+        switch, endpoint turn or walk-hold release must never force it up.  The
+        18:57 field log shows exactly that happening - ``key-down chord=left+down
+        packet=1`` followed one frame later by ``key-up forced=left reason=patrol
+        endpoint reached``, i.e. the "left+Down" hold silently degraded to
+        "Down" (the operator: "left and down is still not binded").
+        """
+
+        return bool(
+            key in ("left", "right")
+            and self._reconnect_drop_edge_input_direction == key
+        )
+
     def _release_endpoint_walk(self, previous: str) -> None:
         """Take the endpoint's walk key off, without reserving a reverse."""
 
         key_up = getattr(self.key_sender, "key_up", None)
         force_key_up = getattr(self.key_sender, "force_key_up", None)
+        if self._edge_chord_owns(previous):
+            # The layer recovery holds Direction+Down as ONE chord.  Releasing the
+            # direction here (the forced release below ignores the ownership
+            # ledger) leaves Down pressed alone, which is what the field log
+            # showed and the operator reported as the chord "not bound".
+            LOG.info(
+                "endpoint release skipped: the layer recovery owns %s+Down",
+                previous,
+            )
+            return
         with self._direction_lock, self._hold_lock:
             if self._walk_hold_key == previous:
                 if callable(key_up):
@@ -18625,6 +19312,10 @@ class MovementWorker(threading.Thread):
         if bool(getattr(self, "flower_patrol_mode", False)):
             return False
         if bool(getattr(self, "_stationary_timed_patrol_active", False)):
+            return False
+        if self.recovery_owns_layer():
+            # Going back to a normal floor pauses attacking (跳打 included): its
+            # Alt beat cancels the Alt+Down / Direction+Down chord.
             return False
         return True
 
@@ -20070,6 +20761,13 @@ class MovementWorker(threading.Thread):
                 self._sync_patrol_controller(coordinate_layout)
                 self._apply_pending_patrol_start(observation)
                 self._consume_stair_jump_completion()
+                # 空打 is deliberately stronger than an attack-cadence skip:
+                # unchanged EXP means both combat and route movement pause.
+                # Keep analysing frames so the first later EXP change can
+                # resume both workers without a new Start Patrol.
+                if self._service_exp_stall_pause():
+                    self.last_observation = observation
+                    continue
                 if self.dead_flower_mode:
                     # The flower route needs the same fresh minimap marker as
                     # normal patrol, but deliberately bypasses every patrol,
@@ -20084,6 +20782,9 @@ class MovementWorker(threading.Thread):
                 if self._service_wait_dead_flower_schedule(
                     observation, time.monotonic(),
                 ):
+                    self.last_observation = observation
+                    continue
+                if self._service_timed_rest_schedule(observation, time.monotonic()):
                     self.last_observation = observation
                     continue
                 # 自动重连: the first frame after the reconnect gave the input back decides

@@ -129,6 +129,13 @@ class AttackWorker(threading.Thread):
         # this worker merely asks the gate at the moment a beat is due.
         self.layer_attack_only = False
         self.layer_attack_allowed_callback = layer_attack_allowed_callback
+        # Recovery gate: unlike the 跑花 layer gate this one is ALWAYS consulted.
+        # The operator's rule (2026-11-18): while the client is trying to get back
+        # to a normal floor (未解析楼层 changing layer), pause attacking - BOTH 跳打
+        # and 站打.  The Alt+Down / Direction+Down chords share the Alt key with the
+        # 跳打 beat and a beat in the middle of a hold cancels it.
+        self.recovery_block_callback: Optional[Callable[[], bool]] = None
+        self._recovery_block_logged = False
         # 站桩攻击 only.  In stand-still mode the anchor correction and 小碎步
         # carry their own attack as the beat itself, so the cadence must not add
         # a second one right after them (see ``spacing_wait_seconds``).  On
@@ -144,6 +151,7 @@ class AttackWorker(threading.Thread):
         # 定时巡逻 stage double the attack gap", and a duplicated boolean would
         # drift apart from the stage that actually owns the route.
         self.stationary_patrol_stage_probe: Optional[Callable[[], bool]] = None
+        self.exp_stall_paused = False
         # The scale the next delay was actually built with, so a stage change is
         # reported once instead of on every beat.
         self._attack_gap_scale_applied: float = 1.0
@@ -180,6 +188,32 @@ class AttackWorker(threading.Thread):
             except Exception:
                 LOG.warning("abnormal attack charge interrupt failed", exc_info=True)
         LOG.warning("ATTACK STOPPED: abnormal event=%s", event_type)
+
+    def set_exp_stall_paused(self, paused: bool) -> None:
+        """Pause cadence beats without disabling the worker permanently."""
+        self.exp_stall_paused = bool(paused)
+
+    def set_recovery_block_gate(
+        self, callback: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        """Attach the movement-owned gate that pauses EVERY attack mode.
+
+        ``True`` means "the layer recovery owns the input right now": the cadence
+        beat is dropped, so 跳打 (Alt -> gap -> attack) and 站打 both stand down
+        until the floor is resolved.  A missing callback never blocks anything.
+        """
+
+        self.recovery_block_callback = callback
+
+    def _recovery_blocked(self) -> bool:
+        callback = self.recovery_block_callback
+        if not callable(callback):
+            return False
+        try:
+            return bool(callback())
+        except Exception:  # noqa: BLE001 - a broken gate must not stop attacks
+            LOG.debug("recovery block gate failed", exc_info=True)
+            return False
 
     def _layer_attack_allowed(self) -> bool:
         if not self.layer_attack_only:
@@ -304,12 +338,14 @@ class AttackWorker(threading.Thread):
     def _combat_input_allowed(self) -> bool:
         """Whether a currently running combat bundle may complete safely."""
 
-        if not self.enabled or self.stop_event.is_set():
+        if not self.enabled or self.exp_stall_paused or self.stop_event.is_set():
             return False
         if (self.automation_active_event is not None
                 and not self.automation_active_event.is_set()):
             return False
         if not self._layer_attack_allowed():
+            return False
+        if self._recovery_blocked():
             return False
         return not (
             self.climbing_active_event is not None
@@ -432,7 +468,7 @@ class AttackWorker(threading.Thread):
                 )
                 next_attack = time.monotonic() + spacing_wait
                 continue
-            can_fire = self.enabled
+            can_fire = self.enabled and not self.exp_stall_paused
             attack_lease = False
             charge_lease = False
             handoff_deferred = False
@@ -455,6 +491,20 @@ class AttackWorker(threading.Thread):
                 # this cadence beat is suppressed until MovementWorker has a
                 # fresh, confirmed layer1 reading.
                 can_fire = False
+            if can_fire and self._recovery_blocked():
+                # 未解析楼层 is changing layer: the chords own Alt, so hold every
+                # attack mode (跳打 and 站打) until the floor is resolved.  One line
+                # per episode, not one per beat.
+                if not self._recovery_block_logged:
+                    self._recovery_block_logged = True
+                    LOG.info(
+                        "attack paused: the layer recovery owns the input "
+                        "(resuming when the floor is resolved)"
+                    )
+                can_fire = False
+            elif self._recovery_block_logged:
+                self._recovery_block_logged = False
+                LOG.info("attack resumed: the layer recovery is over")
             if can_fire:
                 # Advance only for a beat that passed all non-arbiter gates.
                 # A null combo run deliberately consumes this beat without
@@ -497,7 +547,7 @@ class AttackWorker(threading.Thread):
                     reschedule_after_wait = self.spacing_wait_seconds()
                     attack_lease = bool(
                         reschedule_after_wait is None
-                        and self.enabled
+                        and self.enabled and not self.exp_stall_paused
                         and begin()
                     )
                 can_fire = attack_lease

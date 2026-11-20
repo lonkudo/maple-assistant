@@ -20,10 +20,17 @@ from typing import Any, Callable, Optional
 
 from config_store import get_config_store
 from minimap_detector import hud_scale_for
+import instance_state
 from runtime_paths import application_root
 from auto_lie_secret import CredentialRedactionFilter, get_server_secret
 from async_log_writer import AsyncBatchLogWriter
-from crash_reporter import install_fatal_handler, record_exception
+from crash_reporter import (
+    enable_local_dumps,
+    install_fatal_handler,
+    install_run_marker,
+    mark_clean_shutdown,
+    record_exception,
+)
 from versioning import version_label
 import run_mode
 
@@ -141,6 +148,24 @@ class _AnyEvent:
         return any(event.is_set() for event in self._events)
 
 
+def _single_instance_log(lines: list[str]) -> None:
+    """Append lines to ``work/single-instance.log`` (best effort, never raises).
+
+    The file is in the log-cleanup keep list, so a refused start stays readable
+    after the next successful launch - it used to be deleted by that very
+    launch, which is why "it flashed closed again" had no evidence.
+    """
+
+    try:
+        root = application_root(__file__)
+        work = root / "work"
+        work.mkdir(parents=True, exist_ok=True)
+        with (work / "single-instance.log").open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+    except Exception:  # noqa: BLE001 - a refusal must never fail loudly
+        pass
+
+
 def _note_duplicate_instance() -> None:
     """Record a refused duplicate start; the app exits silently by design.
 
@@ -148,15 +173,12 @@ def _note_duplicate_instance() -> None:
     header (the log is opened later), so a start that raced the previous process -
     the normal shape of an update restart - left NO evidence anywhere: the
     operator only saw a process appear and vanish.  One appended line in
-    ``work/single-instance.log`` names the time, the pid and the reason, and the
-    previous instance's pid when it can be read, so the next "it flashed closed"
-    report is answerable.
+    ``work/single-instance.log`` names the time, the pid and the reason, the
+    previous instance's pid when it can be read, and how long that instance's UI
+    poll has been silent, so the next "it flashed closed" report is answerable.
     """
 
     try:
-        root = application_root(__file__)
-        work = root / "work"
-        work.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         lines = [
             f"[{stamp}] duplicate start refused: the single-instance mutex is "
@@ -165,10 +187,105 @@ def _note_duplicate_instance() -> None:
         others = _assistant_instance_pids()
         if others:
             lines.append("    owning instance pid(s): " + ", ".join(map(str, others)))
-        with (work / "single-instance.log").open("a", encoding="utf-8") as handle:
-            handle.write("\n".join(lines) + "\n")
+        state = instance_state.read_state()
+        if state:
+            age = instance_state.beat_age_seconds()
+            lines.append(
+                "    owner state: pid=%s started=%s version=%s ui_poll_silent=%s"
+                % (
+                    state.get("pid"),
+                    time.strftime(
+                        "%Y-%m-%d %H:%M:%S",
+                        time.localtime(float(state.get("started") or 0.0)),
+                    ) if state.get("started") else "?",
+                    state.get("version") or "?",
+                    f"{age:.1f}s" if age is not None else "unknown",
+                )
+            )
+        else:
+            # No liveness record: the owner was started by a build from before
+            # that channel existed (field log 15:27: "owning instance pid(s):
+            # 7908" and nothing else).  Describe the processes themselves, so the
+            # next report says whether the old copy had a window, answered it, and
+            # ran from this install - that is exactly what the takeover decision
+            # needs and what the log was missing.
+            for pid in others:
+                detail = instance_state.describe_process(pid)
+                lines.append(
+                    "    owner pid=%s image=%s same_install=%s age=%s window=%s "
+                    "responding=%s dialog=%s"
+                    % (
+                        detail.get("pid"),
+                        detail.get("image") or "?",
+                        detail.get("same_install"),
+                        f"{detail['age']:.0f}s" if detail.get("age") is not None else "?",
+                        detail.get("window"),
+                        detail.get("responding"),
+                        detail.get("dialog"),
+                    )
+                )
+        _single_instance_log(lines)
     except Exception:  # noqa: BLE001 - a refusal must never fail loudly
         pass
+
+
+def _take_over_stalled_instance() -> int | None:
+    """Take the singleton mutex from an owner whose UI poll has stalled.
+
+    A copy frozen inside a native modal dialog (``tk_messageBox``) still owns the
+    mutex, but it does no UI work: its window is usually behind the game, so the
+    operator sees nothing and simply launches the app again - which used to be
+    refused silently, i.e. a "flash close" that made the second attempt look
+    broken.  The stalled owner is terminated and the mutex re-acquired, so the
+    launch just continues.  Still silent: one line in ``work/single-instance.log``
+    instead of a prompt, and a responding owner (live work) is never touched.
+    """
+
+    try:
+        candidate = instance_state.stalled_owner()
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return None
+    if not candidate:
+        return None
+    pid = int(candidate.get("pid") or 0)
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    silent = candidate.get("beat_age")
+    silent_text = f"{float(silent):.1f}s" if silent is not None else "no record"
+    age = candidate.get("age")
+    age_text = f"{float(age):.0f}s" if age is not None else "?"
+    _single_instance_log([
+        f"[{stamp}] duplicate start: the owning instance pid={pid} is unresponsive "
+        f"(reason={candidate.get('reason')}; ui poll silent {silent_text}; "
+        f"process age {age_text}; window={candidate.get('window')} "
+        f"responding={candidate.get('responding')}; "
+        f"unseen_dialog={bool(candidate.get('unseen_dialog'))}); terminating it and "
+        f"taking over (pid={os.getpid()})"
+    ])
+    if not instance_state.terminate(pid):
+        _single_instance_log([
+            f"[{stamp}] takeover: pid={pid} could not be terminated; staying silent"
+        ])
+        return None
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        try:
+            handle = _acquire_single_instance_mutex()
+        except OSError:
+            # CreateMutex failing for another reason must never turn a refused
+            # start into a crash; the silent exit below is the safe outcome.
+            handle = None
+        if handle is not None:
+            _single_instance_log([
+                f"[{stamp}] takeover: mutex acquired after terminating pid={pid}; "
+                f"starting normally (pid={os.getpid()})"
+            ])
+            return handle
+        time.sleep(0.25)
+    _single_instance_log([
+        f"[{stamp}] takeover: pid={pid} gone but the mutex is still owned; "
+        "staying silent (another copy is alive)"
+    ])
+    return None
 
 
 def _assistant_instance_pids() -> list[int]:
@@ -549,6 +666,17 @@ def _clear_previous_log_files() -> None:
                 for path in base.rglob(pattern):
                     if path.name.casefold() in {
                         "crash_report.log", "ui_hang_trace.log",
+                        # Duplicate-instance and startup-failure evidence.  Both
+                        # are written by a process that is ABOUT to vanish (a
+                        # refused second start, a start that raised), so deleting
+                        # them on the next launch destroyed the only trace of the
+                        # very event that made the operator launch again.
+                        "single-instance.log", "startup-error.log",
+                        # Runs that ended without a clean shutdown (written by the
+                        # NEXT start): the only countable trace of the intermittent
+                        # "it closed by itself".  The marker itself is *.json and
+                        # is never touched by this cleaner.
+                        "unclean-exits.log",
                         # Update/launch evidence that is only ever read AFTER
                         # this process started (see the docstring).
                         "update-helper.log",
@@ -624,12 +752,26 @@ def main() -> int:
     # copy still owned the mutex.
     singleton_handle = _acquire_single_instance_mutex()
     if singleton_handle is None:
+        # The owner may be a copy whose UI poll has stalled (a native modal
+        # dialog that ended up behind the game): it holds the mutex but does no
+        # work, so the operator's next launch must not be refused - that refusal
+        # is the "flash close".  The takeover is silent as well: one line in
+        # work/single-instance.log, never a prompt.
+        singleton_handle = _take_over_stalled_instance()
+    if singleton_handle is None:
         # The launcher replaces an existing copy before starting a fresh one.
         # A short process-exit race can still reach this guard; exit silently
         # instead of showing a misleading "close the old instance" prompt - but
         # leave ONE durable line, otherwise a flash-close has no evidence at all.
         _note_duplicate_instance()
         return 0
+    # Publish the liveness record before anything slow (config, ~30 worker
+    # imports, Tk): a second launch reads it to tell a healthy owner from a
+    # stalled one, and the UI poll keeps its beat fresh from then on.
+    try:
+        instance_state.publish(version=version_label())
+    except Exception:  # noqa: BLE001 - liveness bookkeeping is optional
+        instance_state.publish()
     if startup_splash is not None:
         try:
             startup_splash.show()
@@ -646,6 +788,19 @@ def main() -> int:
             "the fatal-signal handler could not be armed; a native crash will "
             "leave no trace in work/crash_report.log"
         )
+    # "It closes by itself from time to time" has had no trace: an external
+    # termination, a TerminateProcess or a death too early for a dump leaves the
+    # log ending mid-sentence and the next launch clears everything.  The run
+    # marker makes every such death countable and datable (work/unclean-exits.log),
+    # and LocalDumps keeps a minidump so the faulting module can be named.
+    try:
+        _previous_run = install_run_marker(version=version_label())
+    except Exception:  # noqa: BLE001 - diagnostics must never block a start
+        _previous_run = None
+    try:
+        enable_local_dumps()
+    except Exception:  # noqa: BLE001
+        pass
     # 本地测谎: bring the local service up with the app when this build ships it
     # and it is not already listening.  Backgrounded - licence validation and the
     # WS handshake take seconds and must never delay the UI.  Shutdown stops it
@@ -723,6 +878,20 @@ def main() -> int:
             "# ===== log =====\n"
         )
         trace_log_writer.start_new_run(header)
+    # One line in the normal log so the intermittent "it closed by itself" is
+    # visible where the operator already looks (work/assistant.log), with the full
+    # record in work/unclean-exits.log.
+    if isinstance(_previous_run, dict) and not _previous_run.get("clean"):
+        logging.getLogger(__name__).warning(
+            "previous run ended without a clean shutdown "
+            "(pid=%s version=%s started=%s); see work/unclean-exits.log",
+            _previous_run.get("pid"),
+            _previous_run.get("version") or "?",
+            time.strftime(
+                "%Y-%m-%d %H:%M:%S",
+                time.localtime(float(_previous_run.get("started") or 0.0)),
+            ) if _previous_run.get("started") else "?",
+        )
 
     trace_log_writer = AsyncBatchLogWriter(
         trace_log_path,
@@ -2865,6 +3034,12 @@ def main() -> int:
         charge_active_callback=atomic_motion_runner.charge_active,
         charge_interrupt_callback=atomic_motion_runner.interrupt_charge,
     )
+    def _set_empty_attack_pause(paused: bool) -> None:
+        attack_worker.set_exp_stall_paused(paused)
+        movement_worker.set_exp_stall_paused(paused)
+        if paused:
+            abnormal_notifier.notify("空打", stop=False, force_delivery=True)
+    status_worker.exp_stall_callback = _set_empty_attack_pause
     # 增益 1..4 have their own schedule: they must not stop because the HP/MP bar
     # read stopped, and a cast must never be judged by an HP/MP delta.  Delivery
     # still goes through MotionArbiter (safe-stage gate, attack-animation window,
@@ -3253,6 +3428,12 @@ def main() -> int:
     attack_worker.set_layer_attack_gate(
         False, movement_worker.flower_patrol_attack_allowed,
     )
+    # Back to a normal floor: while 未解析楼层 changes layer, EVERY attack mode is
+    # paused (跳打 and 站打), because the Alt+Down / Direction+Down chords share the
+    # Alt key with the 跳打 beat.  MovementWorker owns the state.
+    recovery_gate = getattr(attack_worker, "set_recovery_block_gate", None)
+    if callable(recovery_gate):
+        recovery_gate(movement_worker.recovery_owns_layer)
     motion_arbiter.set_facing_callback(movement_worker.perform_stationary_facing)
     # 站桩攻击's final correction onto the 桩: one tiny step, deliberately
     # concurrent with the fixed attack cadence (see
@@ -3635,6 +3816,9 @@ def main() -> int:
         server_log_writer.close(drain_timeout=1.0)
         trace_log_writer.close(drain_timeout=1.0)
         _release_single_instance_mutex(singleton_handle)
+        # This run reached a real shutdown, so the next start must not report it as
+        # an unclean exit (see crash_reporter.install_run_marker).
+        mark_clean_shutdown()
         # Last step, after every writer is closed: a capture thread wedged inside
         # Win32 would otherwise keep the process (and the mutex) alive after the
         # window is gone.  See ``_force_exit_if_a_thread_is_stuck``.

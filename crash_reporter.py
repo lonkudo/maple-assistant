@@ -9,6 +9,8 @@ this file.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import sys
 import threading
@@ -128,7 +130,168 @@ def install_fatal_handler(path: Path | None = None) -> bool:
         return False
 
 
+def install_run_marker(root: Path | None = None, *, version: str = "") -> Optional[dict]:
+    """Record this run and report the previous one if it died without a clean exit.
+
+    An intermittent "it closed by itself" has no trace today: a native fault
+    writes a faulthandler dump ONLY when there is one (an external termination,
+    a TerminateProcess, or a death so early that the dump cannot be written leaves
+    nothing), the Python log ends mid-sentence, and the next launch clears the
+    logs.  This marker makes each such event countable and datable:
+
+    * ``work/run-marker.json`` is written at startup and stamped ``clean`` by
+      ``mark_clean_shutdown``;
+    * a start that finds a marker from ANOTHER pid without that stamp appends one
+      line to ``work/unclean-exits.log`` - time, version, the old pid/start and
+      the last line of ``work/assistant.log`` (usually the exact place where it
+      died).
+
+    Both files are in the log-cleanup keep list, so the evidence survives.
+    """
+
+    work = (Path(root) if root is not None else application_root()) / "work"
+    marker_path = work / "run-marker.json"
+    previous: Optional[dict] = None
+    try:
+        work.mkdir(parents=True, exist_ok=True)
+        if marker_path.is_file():
+            try:
+                previous = json.loads(marker_path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001 - a broken marker is not fatal
+                previous = None
+        if (
+            isinstance(previous, dict)
+            and not previous.get("clean")
+            and int(previous.get("pid") or 0) != os.getpid()
+        ):
+            _append_unclean_exit(work, previous)
+        marker_path.write_text(
+            json.dumps({
+                "pid": os.getpid(),
+                "started": time.time(),
+                "version": version,
+                "exe": sys.executable,
+                "clean": False,
+            }, ensure_ascii=True),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001 - diagnostics only
+        pass
+    return previous
+
+
+def _append_unclean_exit(work: Path, previous: dict) -> None:
+    """One line per run that ended without calling ``mark_clean_shutdown``."""
+
+    try:
+        started = float(previous.get("started") or 0.0)
+        started_text = (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started))
+            if started else "?"
+        )
+        last_line = ""
+        log_path = work / "assistant.log"
+        if log_path.is_file():
+            try:
+                with log_path.open("r", encoding="utf-8", errors="backslashreplace") as handle:
+                    for line in handle:
+                        if line.strip():
+                            last_line = line.strip()
+            except Exception:  # noqa: BLE001
+                last_line = ""
+        payload = (
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] previous run ended without a "
+            f"clean shutdown: pid={previous.get('pid')} version="
+            f"{previous.get('version') or '?'} started={started_text} "
+            f"exe={previous.get('exe') or '?'}\n"
+            f"    last log line: {last_line[:300] or '(none)'}\n"
+        )
+        with (work / "unclean-exits.log").open("a", encoding="utf-8") as handle:
+            handle.write(payload)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def mark_clean_shutdown(root: Path | None = None) -> None:
+    """Stamp the run marker so the next start does not call this run a crash."""
+
+    work = (Path(root) if root is not None else application_root()) / "work"
+    marker_path = work / "run-marker.json"
+    try:
+        data = {}
+        if marker_path.is_file():
+            try:
+                data = json.loads(marker_path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                data = {}
+        if int(data.get("pid") or 0) not in (0, os.getpid()):
+            return
+        data.update({"clean": True, "ended": time.time()})
+        marker_path.write_text(json.dumps(data, ensure_ascii=True), encoding="utf-8")
+    except Exception:  # noqa: BLE001 - a shutdown must never fail on this
+        pass
+
+
+def enable_local_dumps(root: Path | None = None) -> bool:
+    """Ask Windows Error Reporting to keep a minidump for this image.
+
+    A native fault in a compiled extension leaves "the window disappeared" and,
+    at best, a faulthandler dump that names no module.  ``LocalDumps`` is the only
+    way to get the faulting module and offset, and it must live under HKLM, which
+    this app can write because it already runs elevated.  Best effort: a missing
+    elevation or a locked-down policy only logs.
+    """
+
+    try:
+        import ctypes
+
+        if not ctypes.windll.shell32.IsUserAnAdmin():
+            return False
+    except Exception:  # noqa: BLE001 - not Windows, or no shell32
+        return False
+    try:
+        import winreg
+
+        work = (Path(root) if root is not None else application_root()) / "work"
+        dump_dir = work / "dumps"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        images = {Path(sys.executable).name or ""}
+        images.discard("")
+        images.update({"MoonEclipse.exe", "TodoHelper.exe"})
+        base = (
+            r"SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\\"
+        )
+        written = []
+        for image in sorted(images):
+            try:
+                with winreg.CreateKeyEx(
+                    winreg.HKEY_LOCAL_MACHINE, base + image, 0,
+                    winreg.KEY_SET_VALUE,
+                ) as key:
+                    winreg.SetValueEx(
+                        key, "DumpFolder", 0, winreg.REG_EXPAND_SZ, str(dump_dir),
+                    )
+                    winreg.SetValueEx(key, "DumpType", 0, winreg.REG_DWORD, 1)
+                    winreg.SetValueEx(key, "DumpCount", 0, winreg.REG_DWORD, 3)
+                written.append(image)
+            except OSError:
+                continue
+        if written:
+            try:
+                logging.getLogger(__name__).info(
+                    "crash dumps enabled for %s -> %s",
+                    ", ".join(written), dump_dir,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return False
+    return False
+
+
 __all__ = [
-    "crash_report_path", "install_fatal_handler", "record_current_exception",
+    "crash_report_path", "enable_local_dumps", "install_fatal_handler",
+    "install_run_marker", "mark_clean_shutdown", "record_current_exception",
     "record_exception",
 ]

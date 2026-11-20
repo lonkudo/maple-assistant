@@ -15,7 +15,9 @@ from typing import Any, Literal, Optional
 def _layer_point_ys(layer: Any) -> list[float]:
     """Every recorded Y that makes this layer's detection envelope.
 
-    The three route endpoints (left / rope / right) plus every support point.
+    The three route endpoints (left / rope / right), every support point, and
+    each rest point.  A 休 point is a real floor waypoint: it must make its
+    layer resolvable when the timed-rest state arrives there.
     A support point exists precisely because the operator stood on a row that
     the endpoints alone would not cover - a ditch, a bench, the stair row the
     character lands on after its up jump - so leaving it out of the envelope
@@ -31,6 +33,14 @@ def _layer_point_ys(layer: Any) -> list[float]:
         if isinstance(point, dict) and "y" in point:
             values.append(float(point["y"]))
     if isinstance(layer, dict):
+        rest_points = layer.get("rest_points")
+        if isinstance(rest_points, list):
+            for point in rest_points:
+                if isinstance(point, dict) and "y" in point:
+                    try:
+                        values.append(float(point["y"]))
+                    except (TypeError, ValueError):
+                        continue
         supports = layer.get("support_points")
         if isinstance(supports, list):
             for point in supports:
@@ -49,27 +59,18 @@ LAYER_UP_REACH_FACTOR = 0.7
 
 # Band edge reach around the recorded envelope, in normalised minimap Y.
 #
-# Symmetric 0.02 (operator, this build: "change to 0.02 on both end, lets try").
-# One marker row is 0.006944 (144-px minimap) to 0.010417 (96-px minimap), so
-# 0.02 is a little under two to nearly three rows: a marker drawn one row high
-# or one row low on the floor the character is standing on stays inside that
-# floor's band.  The previous asymmetric hairline (0.003 up / 0.0015 down, a
-# third and a sixth of a row) refused both readings, which is what made a
-# 开始巡逻 refuse with "不属于任何已录制楼层" while the character was standing on
-# the recorded row.
-#
-# Overlap between neighbouring floors needs ``upper + lower`` to exceed the gap
-# between their recorded envelopes.  On the operator's 12 saved recordings the
-# gaps run 0.035 (红庭2, 4 rows) to 0.278 (军3), so 0.02 + 0.02 = 0.04 stays
-# clear everywhere except 红庭2, whose two floors are 0.035088 apart: there the
-# bands share 0.004912 (0.56 of a row) of the empty air between the recorded
-# rows, and ``_layer_y_candidates`` resolves that strip by distance to the
-# nearest recorded row.  皇冠_牧师 is the next tightest at 0.041440, i.e. clear
-# by 0.001440 (0.24 rows).
-LAYER_BAND_UPPER_EDGE_REACH = 0.02
-LAYER_BAND_LOWER_EDGE_REACH = 0.02
+# Ordinary recorded floors accept 0.030 on each side of their supporter
+# envelope.  A vertical up-jump marks a deliberately tight pair: its source
+# layer narrows only its upper edge to 0.015, and the immediately higher
+# recorded layer narrows only its lower edge to 0.015.  This is determined by
+# recorded Y geometry, never by the patrol/recording sequence.
+LAYER_BAND_UPPER_EDGE_REACH = 0.03
+LAYER_BAND_LOWER_EDGE_REACH = 0.03
+LAYER_UP_JUMP_SOURCE_UPPER_EDGE_REACH = 0.015
+LAYER_UP_JUMP_TARGET_LOWER_EDGE_REACH = 0.015
 
-# Schema stamp written into ``layer_band``.  5 adds the support points to the
+# Schema stamp written into ``layer_band``.  6 adds geometry-derived up-jump
+# pair reaches.  5 adds the support points to the
 # WORLD envelope (they already fed the marker envelope), so a recorded 低/高
 # supporter widens both bands the way the three route endpoints do.  4 is the
 # symmetric 0.02 reach.  3 was the swapped hairline (0.003 up / 0.0015 down), 2
@@ -77,7 +78,7 @@ LAYER_BAND_LOWER_EDGE_REACH = 0.02
 # this rule on load, so an existing recording adopts the new edges instead of
 # keeping the old ones; the stamp makes a stale document recognisable when a
 # profile is inspected.
-LAYER_BAND_VERSION = 5
+LAYER_BAND_VERSION = 6
 
 # Last-resort ``small_gap`` for a single-supporter layer whose recording carries no layout at all, so one
 # marker row cannot be derived.  Kept identical to
@@ -250,7 +251,23 @@ def _layer_world_values(layer: Any) -> list[float]:
     return values
 
 
-def _recalculate_layer_band(layer: Any) -> bool:
+def _has_up_jump_point(layer: Any) -> bool:
+    """Whether this concrete layer/part records a vertical up jump."""
+
+    if not isinstance(layer, dict):
+        return False
+    points = layer.get("jump_points")
+    return isinstance(points, list) and any(
+        isinstance(point, dict) and str(point.get("direction", "")).casefold() == "up"
+        for point in points
+    )
+
+
+def _recalculate_layer_band(
+    layer: Any, *,
+    upper_reach: float = LAYER_BAND_UPPER_EDGE_REACH,
+    lower_reach: float = LAYER_BAND_LOWER_EDGE_REACH,
+) -> bool:
     """Materialise one layer's complete Y/world-Y detection envelope.
 
     Left-most, rope, right-most and every support point are supporters; the
@@ -258,9 +275,10 @@ def _recalculate_layer_band(layer: Any) -> bool:
     jump lands on) belong to this floor instead of "no floor".  Jump points
     deliberately never change a layer's identity.  A single supporter produces
     the documented one-sided ``[y, y + small_gap]`` envelope; two or more
-    supporters span their observed top/bottom positions with the symmetric edge
-    reach: ``LAYER_BAND_UPPER_EDGE_REACH`` / ``LAYER_BAND_LOWER_EDGE_REACH``
-    (both 0.02).  The same calculation produces the world-Y band.
+    supporters span their observed top/bottom positions with the supplied edge
+    reach.  Callers normally supply 0.030 at both edges; the full rebuild gives
+    an up-jump source a 0.015 upper edge and its directly higher neighbour a
+    0.015 lower edge.  The same calculation produces the world-Y band.
     """
 
     if not isinstance(layer, dict):
@@ -275,11 +293,10 @@ def _recalculate_layer_band(layer: Any) -> bool:
         raw_upper = raw_lower = values[0]
     else:
         raw_upper, raw_lower = min(values), max(values)
-    # Symmetric edge reach (operator this build): 0.02 on both sides of the
-    # recorded envelope - about two marker rows, so the floor's own band admits
-    # the marker's one-row quantisation instead of refusing it as "no floor".
-    y_upper = raw_upper - LAYER_BAND_UPPER_EDGE_REACH
-    y_lower = raw_lower + LAYER_BAND_LOWER_EDGE_REACH
+    upper_reach = max(0.0, float(upper_reach))
+    lower_reach = max(0.0, float(lower_reach))
+    y_upper = raw_upper - upper_reach
+    y_lower = raw_lower + lower_reach
 
     # Same supporters as the marker-Y envelope above: the endpoints AND every
     # support point, so a 低/高 row widens the world band exactly the way it
@@ -386,6 +403,19 @@ def _layer_has_flower_point(layer: Any) -> bool:
     """Whether a layer has at least one usable flower waypoint."""
 
     points = layer.get("flower_points") if isinstance(layer, dict) else None
+    return bool(
+        isinstance(points, list)
+        and any(
+            isinstance(point, dict) and "x" in point and "y" in point
+            for point in points
+        )
+    )
+
+
+def _layer_has_rest_point(layer: Any) -> bool:
+    """Whether a layer has at least one usable timed-rest waypoint."""
+
+    points = layer.get("rest_points") if isinstance(layer, dict) else None
     return bool(
         isinstance(points, list)
         and any(
@@ -592,11 +622,15 @@ class PatrolController:
             self._selected_layer = self._final_layer_name_locked()
             self._inverted_range_reported = ("", "")
 
-    def can_start(self, *, allow_flower_only_layers: bool = False) -> bool:
+    def can_start(
+        self, *, allow_flower_only_layers: bool = False,
+        allow_rest_only_layers: bool = False,
+    ) -> bool:
         """Whether the selected patrol route passes its active-mode gate."""
 
         return not self.validate_patrol_route(
             allow_flower_only_layers=allow_flower_only_layers,
+            allow_rest_only_layers=allow_rest_only_layers,
         )
 
     def _patrol_route_layers_locked(self) -> list[str]:
@@ -613,6 +647,7 @@ class PatrolController:
 
     def validate_patrol_route(
         self, *, allow_flower_only_layers: bool = False,
+        allow_rest_only_layers: bool = False,
     ) -> tuple[str, ...]:
         """Return human-readable errors for the selected patrol route.
 
@@ -658,6 +693,11 @@ class PatrolController:
                 # 等死花 may deliberately wait on a flower-only layer.  In
                 # that one mode, 花 is a legal route supporter without 最左/最右.
                 if allow_flower_only_layers and _layer_has_flower_point(layer):
+                    continue
+                # 定时休息 uses the same location-only route shape: a 休 point
+                # is enough for a layer that is only visited to rest, while
+                # ordinary patrol remains strict about 最左 / 最右.
+                if allow_rest_only_layers and _layer_has_rest_point(layer):
                     continue
                 missing = [
                     label for point, label in (
@@ -813,19 +853,75 @@ class PatrolController:
         reaching into the floor above and the overlap would survive the update.
         """
 
-        changed = False
         layers = self._profile.get("layers", {})
         if not isinstance(layers, dict):
             return False
-        for layer in layers.values():
+
+        # Resolve each map section separately.  An up-jump in the left third
+        # must not narrow a floor in the right third merely because both happen
+        # to carry the same logical layer name.
+        sections: dict[Optional[str], list[tuple[str, dict[str, Any]]]] = {}
+        for name, layer in layers.items():
             if not isinstance(layer, dict):
                 continue
-            changed = _recalculate_layer_band(layer) or changed
             parts = layer.get("part_points")
             if isinstance(parts, dict):
-                for part in parts.values():
+                # Keep a legacy parent recording materialised as well.  New
+                # split recordings store points in their parts only, so there
+                # is normally no parent envelope to add here.
+                if _layer_point_ys(layer):
+                    sections.setdefault(None, []).append((name, layer))
+                for part_name, part in parts.items():
                     if isinstance(part, dict):
-                        changed = _recalculate_layer_band(part) or changed
+                        sections.setdefault(str(part_name), []).append((name, part))
+            else:
+                sections.setdefault(None, []).append((name, layer))
+
+        changed = False
+        for section_layers in sections.values():
+            # Start at the ordinary +/- 0.030 rule.  The reach table is kept
+            # per concrete part, not per layer name, because split-map parts
+            # have independent recorded floors.
+            reaches = {
+                id(layer): [LAYER_BAND_UPPER_EDGE_REACH, LAYER_BAND_LOWER_EDGE_REACH]
+                for _name, layer in section_layers
+            }
+            envelopes: list[tuple[str, dict[str, Any], float, float]] = []
+            for name, layer in section_layers:
+                values = _layer_point_ys(layer)
+                if values:
+                    envelopes.append((name, layer, min(values), max(values)))
+
+            for _name, source, source_top, _source_bottom in envelopes:
+                if not _has_up_jump_point(source):
+                    continue
+                # The layer carrying Ctrl+End narrows its visually upper edge
+                # (smaller screen Y); its lower edge remains at +0.030.
+                reaches[id(source)][0] = LAYER_UP_JUMP_SOURCE_UPPER_EDGE_REACH
+
+                # "Next" means the closest recorded floor above it on the
+                # minimap: its lowest recorded supporter is still above the
+                # up-jump layer's top supporter.  This is deliberately based
+                # on Y, not route order or point recording order.
+                candidates = [
+                    (candidate_bottom, candidate)
+                    for _candidate_name, candidate, _candidate_top, candidate_bottom
+                    in envelopes
+                    if candidate is not source and candidate_bottom < source_top
+                ]
+                if not candidates:
+                    continue
+                _bottom, target = max(candidates, key=lambda item: item[0])
+                # An up-jump source keeps its explicit +0.030 lower reach even
+                # if it is also the target of another layer's up-jump pair.
+                if not _has_up_jump_point(target):
+                    reaches[id(target)][1] = LAYER_UP_JUMP_TARGET_LOWER_EDGE_REACH
+
+            for _name, layer in section_layers:
+                upper, lower = reaches[id(layer)]
+                changed = _recalculate_layer_band(
+                    layer, upper_reach=upper, lower_reach=lower,
+                ) or changed
         return changed
 
     def _ensure_split_part_buckets_locked(self) -> bool:
@@ -930,7 +1026,7 @@ class PatrolController:
                     continue
                 old_parts = layer.get("part_points")
                 parts: dict[str, Any] = {}
-                for name in (*REQUIRED_LAYER_POINTS, "jump_points", "skill_points", "flower_points", "support_points"):
+                for name in (*REQUIRED_LAYER_POINTS, "jump_points", "skill_points", "flower_points", "rest_points", "support_points"):
                     values: list[Any] = []
                     if isinstance(old_parts, dict):
                         for old_part in old_parts.values():
@@ -958,7 +1054,7 @@ class PatrolController:
                         ):
                             if anchor_key in layer:
                                 target.setdefault(anchor_key, deepcopy(layer[anchor_key]))
-                        if name in ("jump_points", "skill_points", "flower_points", "support_points"):
+                        if name in ("jump_points", "skill_points", "flower_points", "rest_points", "support_points"):
                             target.setdefault(name, []).append(deepcopy(item))
                         else:
                             target[name] = deepcopy(item)
@@ -1576,6 +1672,38 @@ class PatrolController:
             self._persist_locked()
             return RecordedEndpoint(layer_name, "flower_point", point["x"], point["y"])
 
+    def record_rest_point(
+        self, player_x: float, player_y: float,
+        layout: Optional[CoordinateLayout] = None,
+    ) -> RecordedEndpoint:
+        """Record one horizontal timed-rest waypoint on the selected layer."""
+
+        with self._lock:
+            layer_name = self._selected_layer
+            layer = self._profile.get("layers", {}).get(layer_name)
+            if not isinstance(layer, dict):
+                raise ValueError("没有可录制的楼层；请先点击「添加楼层」")
+            point: dict[str, Any] = {
+                "x": round(max(0.02, min(0.98, float(player_x))), 6),
+                "y": round(max(0.02, min(0.98, float(player_y))), 6),
+                "source": "manual-ui",
+            }
+            if layout is not None:
+                stable_x, stable_y = layout.stable_point(player_x, player_y)
+                point["coordinate_v2"] = {
+                    "x_diamond": round(stable_x, 6),
+                    "y_diamond": round(stable_y, 6),
+                    "recorded_layout": layout.as_dict(),
+                }
+            target = (self._part_layer_locked(
+                layer, self._part_index_for_x_locked(point["x"]), create=True,
+            ) if self._split_points_locked() else layer)
+            assert target is not None
+            target["rest_points"] = [point]
+            _recalculate_layer_band(target)
+            self._persist_locked()
+            return RecordedEndpoint(layer_name, "rest_point", point["x"], point["y"])
+
     def record_support_point(
         self, player_x: float, player_y: float,
         layout: Optional[CoordinateLayout] = None,
@@ -1675,7 +1803,7 @@ class PatrolController:
         """
 
         allowed = set(REQUIRED_LAYER_POINTS) | {
-            "jump_point", "skill_point", "flower_point", "support_point",
+            "jump_point", "skill_point", "flower_point", "rest_point", "support_point",
         }
         if point_kind not in allowed:
             raise ValueError(f"不支持的点类型：{point_kind}")
@@ -1691,7 +1819,7 @@ class PatrolController:
             )
             if not isinstance(target, dict):
                 return False
-            if point_kind in ("jump_point", "skill_point", "flower_point", "support_point"):
+            if point_kind in ("jump_point", "skill_point", "flower_point", "rest_point", "support_point"):
                 field = f"{point_kind}s"
                 points = target.get(field)
                 if not isinstance(points, list) or index is None:
@@ -1933,6 +2061,11 @@ class PatrolController:
             return highest_name
 
     def _persist_locked(self) -> None:
+        # A Ctrl+End up-jump changes a neighbouring layer's edge as well as
+        # its own.  Rebuild just before every write so adding, deleting,
+        # importing, or moving any relevant point cannot leave a stale paired
+        # envelope in the saved configuration.
+        self._materialise_layer_bands_locked()
         if self.config_store is not None:
             self.config_store.write_section("recording", self._profile)
             return

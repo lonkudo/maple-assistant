@@ -41,6 +41,7 @@ from licensing import (  # noqa: E402
     machine_fingerprint_hash,
     remember_boot_identity,
     verify_document,
+    verify_license,
     warm_device_identity,
 )
 from pinned_tls import PinnedTlsError, PinnedTlsResponseError, post_json  # noqa: E402
@@ -635,6 +636,178 @@ def _previous_install_profile_code(root: Path) -> str:
     return ""
 
 
+def _looks_like_install(folder: Path) -> bool:
+    """A folder carrying an installation, judged only by what it contains."""
+
+    try:
+        if not folder.is_dir():
+            return False
+        has_version = (folder / "VERSION").is_file()
+        has_entry = any(
+            (folder / name).is_file()
+            for name in (PROTECTED_EXECUTABLE, "MoonEclipse.exe", "TodoHelper.exe",
+                         "assistant.py")
+        )
+        return has_version and has_entry
+    except OSError:
+        return False
+
+
+def _other_installs_on_this_machine(exclude_root: Path | None = None) -> list[tuple[Path, str]]:
+    """Installations already present on this PC (path, version).
+
+    Two passes, both bounded:
+
+    * the installer's OWN folder chain (the exe directory, its parent, the current
+      directory and their parents) - the installer is very often run from inside
+      an activated copy, e.g. ``<install>\\release\\MoonEclipseInstaller.exe``, and
+      missing that made it ask for a code that then failed as expired;
+    * the user's usual folders plus the immediate children of every drive, two
+      levels deep, where a customer's second copy normally lands.
+    """
+
+    found: list[tuple[Path, str]] = []
+    seen: set[str] = set()
+    excluded = ""
+    try:
+        if exclude_root is not None:
+            excluded = os.path.normcase(str(Path(exclude_root).resolve()))
+    except OSError:
+        excluded = ""
+
+    def _key(path: Path) -> str:
+        try:
+            return os.path.normcase(str(path.resolve()))
+        except OSError:
+            return os.path.normcase(str(path))
+
+    def _consider(path: Path) -> None:
+        key = _key(path)
+        if key in seen or key == excluded:
+            return
+        seen.add(key)
+        if not _looks_like_install(path):
+            return
+        version = ""
+        try:
+            version = (path / "VERSION").read_text(
+                encoding="utf-8-sig", errors="replace",
+            ).strip().splitlines()[0].lstrip("\ufeff").strip()
+        except Exception:  # noqa: BLE001 - an unreadable version is just ""
+            version = ""
+        found.append((path, version))
+
+    # 1) the installer's own chain
+    chain: list[Path] = []
+    try:
+        chain.append(Path.cwd())
+        chain.append(Path(sys.executable).parent)
+    except Exception:  # noqa: BLE001 - no cwd/exe means nothing to add
+        pass
+    try:
+        chain.append(Path(sys.argv[0]).resolve().parent)
+    except Exception:  # noqa: BLE001
+        pass
+    for base in list(chain):
+        for candidate in (base, base.parent, base.parent.parent):
+            try:
+                _consider(candidate)
+            except Exception:  # noqa: BLE001
+                continue
+
+    # 2) the user's folders and the drives, two levels deep
+    bases: list[Path] = []
+    try:
+        home = Path.home()
+        for name in ("Desktop", "Documents", "Downloads"):
+            bases.append(home / name)
+    except Exception:  # noqa: BLE001 - no home means nothing to scan
+        pass
+    for letter in "CDEFGH":
+        drive = Path(f"{letter}:\\")
+        try:
+            if drive.is_dir():
+                bases.append(drive)
+        except OSError:
+            continue
+    for base in bases:
+        try:
+            entries = list(base.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if not entry.is_dir() or entry.name.startswith("."):
+                    continue
+            except OSError:
+                continue
+            _consider(entry)
+            try:
+                for nested in entry.iterdir():
+                    if nested.is_dir() and not nested.name.startswith("."):
+                        _consider(nested)
+            except OSError:
+                continue
+    return found
+
+
+def _code_from_other_installs(exclude_root: Path) -> tuple[str, str]:
+    """The activation code another installation of this PC uses, if any.
+
+    ``(code, source)``.  A new folder on an already-installed machine should not
+    need the operator to type the code at all: the sibling installation holds the
+    very code that works, and typing a stale one by hand is exactly how "授权已过期"
+    appears out of nowhere (a missing licence file is ``missing``/"未授权：请激活授权码",
+    never "expired").
+    """
+
+    try:
+        candidates = _other_installs_on_this_machine(exclude_root)
+    except Exception:  # noqa: BLE001 - the scan is best effort
+        return "", ""
+    for folder, _version in candidates:
+        for base in (folder, folder / "助手配置", folder / "app", folder / "app" / "助手配置"):
+            for name in ("auth.json", "license.json"):
+                path = base / name
+                try:
+                    if not path.is_file():
+                        continue
+                    # utf-8-sig: a document written by an editor or by PowerShell
+                    # carries a BOM, and a BOM must not make the code invisible.
+                    document = json.loads(
+                        path.read_text(encoding="utf-8-sig", errors="replace")
+                    )
+                except (OSError, ValueError):
+                    continue
+                local = document.get("_local") if isinstance(document, dict) else None
+                code = ""
+                if isinstance(local, dict):
+                    code = "".join(str(local.get("activation_code") or "").split())
+                if code:
+                    logging.info(
+                        "installer: reusing the activation code found in %s", path,
+                    )
+                    return code, str(folder)
+    return "", ""
+
+
+def _local_licence_state(root: Path) -> tuple[str, str]:
+    """``(code, message)`` for the entitlement this folder actually holds.
+
+    The operator's rule (2026-11-19): only a LICENSE FILE THAT EXISTS AND VERIFIES
+    AS EXPIRED may be called 过期.  A folder without one is a NEW LOCATION and must
+    be treated as such - never reported as expired, whatever the server says about
+    a code somebody typed.
+    """
+
+    try:
+        status = verify_license(root)
+        return str(status.code or "?"), str(status.message or "")
+    except Exception as exc:  # noqa: BLE001 - an unreadable profile is "missing"
+        logging.exception("installer: local licence state could not be read")
+        return "unreadable", str(exc)
+
+
 def _is_previous_install(root: Path) -> bool:
     """Whether ``root`` already holds an installation.
 
@@ -695,13 +868,27 @@ def _activate(code: str) -> tuple[str, Any, Any]:
             payload, PIN_ROOT / "activation_server_pin.json",
         )
     except PinnedTlsResponseError as exc:
-        if str(getattr(exc, "code", "")) == "BOUND_CODE":
+        server_code = str(getattr(exc, "code", ""))
+        server_message = getattr(exc, "message", "") or str(exc)
+        # The server's own code decides what the operator may do next, and the
+        # message alone is ambiguous ("授权已过期" and "已绑定到另一台设备" both end
+        # the install).  Record it, so a later report never has to guess which
+        # branch fired.
+        logging.warning(
+            "installer: activation refused by the server code=%s message=%s",
+            server_code or "?", server_message,
+        )
+        if server_code in ("BOUND_CODE", "DEVICE_MISMATCH"):
             # Not a dead end: the desktop answers the same refusal with the
             # transfer the operator confirms, and this installer offers it too.
+            # DEVICE_MISMATCH is the same situation under the code the desktop
+            # endpoint uses, and it used to fall through to a dead-end error.
             raise ActivationBoundElsewhereError(
-                getattr(exc, "message", "") or "该授权码已绑定到另一台设备。"
+                server_message or "该授权码已绑定到另一台设备。"
             ) from exc
-        raise RuntimeError(f"授权失败：{getattr(exc, 'message', str(exc))}") from exc
+        if server_code == "LICENSE_EXPIRED":
+            raise ActivationExpiredError(server_message or "授权已过期。") from exc
+        raise RuntimeError(f"授权失败：{server_message}") from exc
     except PinnedTlsError as exc:
         raise RuntimeError(f"授权失败：无法连接到授权服务器（{exc}）") from exc
     token = str((answer or {}).get("session_token") or "")
@@ -956,9 +1143,30 @@ class ActivationBoundElsewhereError(RuntimeError):
     """
 
 
+class ActivationExpiredError(RuntimeError):
+    """The server accepted this device but the code itself has expired.
+
+    Deliberately separate from ``ActivationBoundElsewhereError``: an expired code
+    cannot be moved by unbinding it, and telling the operator to "transfer" would
+    send them in circles.  The message names the expiry and, when this PC already
+    runs an installation, points at that one - the usual reason a second folder is
+    being installed is that the operator forgot the first.
+    """
+
+
 # The activation server keeps a confirmation token valid for 90 seconds; starting
 # the installer again re-runs the preview and issues a fresh one.
 TRANSFER_CONFIRMATION_SECONDS = 90
+# How many times the two binding steps may hand a fresh code to the server before
+# the installer stops.  A refusal (expired, bound elsewhere, invalid) always leads
+# back to those steps - it is never a dead-end message.
+MAX_CODE_ATTEMPTS = 4
+# How long a worker waits for the Tk thread to answer the two binding steps.
+CODE_REQUEST_TIMEOUT_SECONDS = 600.0
+# Nothing about a missing authorisation aborts an install: the worker waits for
+# the authorisation to complete and then installs normally.  This is the pause
+# between two rounds of asking while the window stays open.
+AUTHORIZATION_WAIT_RETRY_SECONDS = 15.0
 
 
 def _transfer_preview(code: str) -> dict[str, Any]:
@@ -1576,6 +1784,20 @@ class InstallerWindow:
         self._pending_code = ""
         self._pending_root: Path | None = None
         self._transfer_note = ""
+        # Set when this install takes the activation over from another folder of
+        # this same machine (see _confirm_rebind / _finish_rebind).
+        self._rebind_from = ""
+        # The local entitlement verdict for the selected folder: "missing" means a
+        # new location, "expired" means a real expired licence file.
+        self._local_licence_code = ""
+        # Two-step binding question asked from a worker thread (the Tk thread owns
+        # the dialogs and answers through this event).
+        self._code_request_event: threading.Event | None = None
+        self._code_request_answer = ""
+        self._code_request_has_other = False
+        # The install thread waits for authorisation instead of aborting, so it
+        # needs a way to learn that the window is gone.
+        self.closed = threading.Event()
         # The VERSION already in the chosen folder, shown as (已安装).
         self._installed_version_text = ""
         self.progress_value = 0.0
@@ -1619,32 +1841,57 @@ class InstallerWindow:
         self.install.grid(row=5, column=2, sticky="e", pady=(16, 0))
         self._paint_eclipse(0.0)
         self.root.after(50, self._drain_events)
+        try:
+            self.root.protocol("WM_DELETE_WINDOW", self._on_window_closed)
+        except Exception:  # noqa: BLE001 - a missing protocol only loses the flag
+            logging.debug("installer: close protocol could not be installed")
+
+    def _on_window_closed(self) -> None:
+        """Stop the install thread's authorisation wait, then close the window."""
+
+        self.closed.set()
+        try:
+            event = self._code_request_event
+            if event is not None:
+                self._code_request_answer = ""
+                event.set()
+        except Exception:  # noqa: BLE001 - closing must never fail
+            pass
+        try:
+            self.root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _ask_activation_code(self) -> str:
-        """Ask for the activation code, for a NEW installation folder only.
+        """Second of the two binding steps: take the activation code.
 
-        An installation that already holds its licensed profile never reaches
-        this dialog: its code is taken from ``auth.json`` (see
+        An installation that already holds its licensed profile never reaches this
+        dialog: its code is taken from ``auth.json`` (see
         ``_previous_install_profile_code``), so updating an existing folder never
         asks the operator to retype it.
+
+        Customer wording only.  When another folder of this PC already carries an
+        entitlement, its code is pre-filled, so the client confirms twice instead
+        of hunting for a code that may long be expired.
         """
 
         answer = {"code": ""}
+        suggestion, _suggestion_source = _code_from_other_installs(Path.cwd())
         dialog = tk.Toplevel(self.root)
-        dialog.title("首次安装需要授权码")
+        dialog.title("绑定授权")
         dialog.transient(self.root)
         dialog.resizable(False, False)
         frame = ttk.Frame(dialog, padding=16)
         frame.grid(sticky="nsew")
+        prompt = "请输入授权码以完成绑定："
         ttk.Label(
-            frame,
-            text="这是一个新的安装位置。\n请输入授权码以完成首次安装：",
-            justify="left",
+            frame, text=prompt, justify="left",
         ).grid(row=0, column=0, columnspan=2, sticky="w")
-        value = tk.StringVar()
+        value = tk.StringVar(value=suggestion)
         entry = ttk.Entry(frame, textvariable=value, width=52)
         entry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         entry.focus_set()
+        entry.select_range(0, "end")
 
         def confirm(_event: object = None) -> None:
             answer["code"] = value.get().strip()
@@ -1701,6 +1948,14 @@ class InstallerWindow:
         if self.running:
             return
         root = Path(self.install_root.get()).expanduser()
+        # What THIS folder actually holds decides the wording further down: no
+        # licence file is a NEW LOCATION (never "expired"), an existing file that
+        # verifies as past its date is a real expiry.
+        self._local_licence_code, local_message = _local_licence_state(root)
+        logging.info(
+            "installer: local licence state at %s = %s (%s)",
+            root, self._local_licence_code, local_message or "no message",
+        )
         # An old-layout installation (everything under app\) is adopted into the
         # selected root first: its marker makes the folder an existing install
         # and its 助手配置 (user_config.json, auth.json, saved maps) is copied to
@@ -1711,7 +1966,7 @@ class InstallerWindow:
             logging.exception("installer: legacy install migration failed")
         # An existing installation carries its licensed profile: update it with
         # the stored code and never ask again.  Only a NEW folder (no install
-        # marker, no profile) prompts for the activation code.
+        # marker, no profile) needs the code from somewhere else.
         code = ""
         if _is_previous_install(root):
             code = _previous_install_profile_code(root)
@@ -1721,9 +1976,13 @@ class InstallerWindow:
                     "asking for the activation code", root,
                 )
         if not code:
-            code = self._ask_activation_code()
-            if not code:
-                return
+            # A folder without a licence is a NEW location: the install thread
+            # runs the two customer steps and WAITS for the authorisation to
+            # complete instead of aborting (see _await_authorisation).
+            logging.info(
+                "installer: %s holds no licence; the authorisation will be "
+                "requested before the install starts", root,
+            )
         self.running = True
         self.install.state(["disabled"])
         self.status.configure(
@@ -1759,21 +2018,64 @@ class InstallerWindow:
                 )
                 self.events.put(("hint", DEVICE_NOT_READY_HINT))
                 return
-            try:
-                _token, release, versions = _activate_with_device_retry(code)
-            except DeviceNotReadyError:
-                logging.warning("installer: device fingerprint not ready")
-                self.events.put(("hint", DEVICE_NOT_READY_HINT))
-                return
-            except ActivationBoundElsewhereError as exc:
-                logging.warning("installer: code bound elsewhere (%s)", exc)
-                transferred, note = self._offer_activation_transfer(code)
-                if not transferred:
-                    self.events.put(("hint", note))
+            # Activation, with the customer's two binding steps for EVERY refusal.
+            # An expired code is not a dead end: it is exactly the moment to ask
+            # "bind the licence to this new folder?" and take another code.  And
+            # nothing here aborts an install: while the window is open the worker
+            # waits for the authorisation to complete and then installs normally.
+            attempts = 0
+            versions = None
+            while not self.closed.is_set():
+                if not code:
+                    code = self._await_authorisation(root)
+                    if not code:
+                        return
+                    self._pending_code = code
+                    attempts = 0
+                    continue
+                attempts += 1
+                try:
+                    _token, release, versions = _activate_with_device_retry(code)
+                    break
+                except DeviceNotReadyError:
+                    logging.warning("installer: device fingerprint not ready")
+                    self.events.put(("hint", DEVICE_NOT_READY_HINT))
                     return
-                transfer_note = note
-                _token, release, versions = _activate(code)
+                except ActivationBoundElsewhereError as exc:
+                    logging.warning("installer: code bound elsewhere (%s)", exc)
+                    transferred, note = self._offer_activation_transfer(code)
+                    if transferred:
+                        transfer_note = note
+                        if attempts <= MAX_CODE_ATTEMPTS:
+                            continue
+                    failure = f"该授权码已绑定到其他设备"
+                except ActivationExpiredError as exc:
+                    logging.warning("installer: activation code expired (%s)", exc)
+                    failure = "该授权码已过期"
+                except Exception as exc:  # noqa: BLE001 - any other refusal
+                    logging.warning("installer: activation refused (%s)", exc)
+                    failure = str(exc) or "授权码未通过验证"
+
+                logging.info(
+                    "installer: authorisation not ready yet (%s, attempt %d)",
+                    failure, attempts,
+                )
+                if attempts >= MAX_CODE_ATTEMPTS:
+                    # Never a dead end: pause, then ask again from a clean slate.
+                    self.events.put(("status", f"{failure}。等待授权完成…"))
+                    attempts = 0
+                else:
+                    self.events.put(("status", "等待授权完成…"))
+                if self.closed.wait(AUTHORIZATION_WAIT_RETRY_SECONDS):
+                    return
+                code = ""
             if versions is None or not getattr(versions, "entries", ()):
+                if self.closed.is_set():
+                    logging.info(
+                        "installer: the window closed while the authorisation "
+                        "was still pending; nothing was installed"
+                    )
+                    return
                 self.events.put((
                     "hint",
                     "服务器当前没有开放的版本，无法安装。\n"
@@ -2054,6 +2356,86 @@ class InstallerWindow:
         )
         return True, f"已将授权从设备 {old_id} 更换到本机。"
 
+    def _request_code_from_operator(self, has_other_install: bool) -> str:
+        """Worker-side: run the two customer steps on Tk and return the code.
+
+        Tk widgets may only be touched from their own thread, so the worker parks
+        on an event and the drain handler asks the two questions in order.  An
+        empty result means the operator cancelled either step.
+        """
+
+        event = threading.Event()
+        self._code_request_event = event
+        self._code_request_answer = ""
+        self._code_request_rebind = False
+        self._code_request_has_other = bool(has_other_install)
+        self.events.put(("code-ask", bool(has_other_install)))
+        deadline = time.monotonic() + CODE_REQUEST_TIMEOUT_SECONDS
+        answered = False
+        while not answered:
+            answered = event.wait(0.25)
+            if answered:
+                break
+            if self.closed.is_set():
+                # The window is gone: the question can never be answered.
+                logging.info("installer: the window closed during the code question")
+                self._code_request_event = None
+                self._code_request_answer = ""
+                self._code_request_rebind = False
+                return ""
+            if time.monotonic() >= deadline:
+                logging.warning("installer: the code question timed out")
+                self._code_request_event = None
+                return ""
+        answer = str(getattr(self, "_code_request_answer", "") or "").strip()
+        self._code_request_event = None
+        self._code_request_answer = ""
+        return answer
+
+    def _await_authorisation(self, root: Path) -> str:
+        """Ask for the binding until a code is given; wait, never abort.
+
+        Called from the install thread: the two customer steps run on the Tk
+        thread through ``_request_code_from_operator``.  A cancelled question
+        only means "not yet" - the window keeps the run alive, the status line
+        says ``等待授权完成…``, and after a short pause the steps are asked again.
+        An empty result means the window was closed.
+        """
+
+        while not self.closed.is_set():
+            siblings = _other_installs_on_this_machine(root)
+            source = siblings[0] if siblings else None
+            if siblings:
+                logging.info(
+                    "installer: %d other installation(s) on this PC; first=%s (%s)",
+                    len(siblings), source[0], source[1] or "?",
+                )
+            candidate = self._request_code_from_operator(bool(siblings))
+            if candidate:
+                logging.info(
+                    "installer: activation code received (%d characters, rebind=%s)",
+                    len(candidate), bool(getattr(self, "_code_request_rebind", False)),
+                )
+                if source is not None and getattr(self, "_code_request_rebind", False):
+                    # Step 1 was accepted: the existing licence moves here.
+                    self._rebind_from = str(source[0])
+                    logging.info(
+                        "installer: binding moves from %s to %s", source[0], root,
+                    )
+                else:
+                    self._rebind_from = ""
+                return candidate
+            if self.closed.is_set():
+                break
+            logging.info(
+                "installer: no authorisation yet; waiting for it to complete"
+            )
+            self.events.put(("status", "等待授权完成…"))
+            if self.closed.wait(AUTHORIZATION_WAIT_RETRY_SECONDS):
+                break
+        logging.info("installer: the window closed before authorisation completed")
+        return ""
+
     def _ask_transfer_permission(self, old_id: str) -> bool:
         """Ask on the Tk thread; the worker blocks until the answer arrives."""
 
@@ -2165,6 +2547,11 @@ class InstallerWindow:
                 elif kind == "stage":
                     self._stage_text = str(value)
                     self.status.configure(text=self._stage_text)
+                elif kind == "status":
+                    # A plain line in the status row: no dialog, no failure.  It
+                    # is how the window says 等待授权完成… while the install
+                    # thread waits for the authorisation instead of aborting.
+                    self.status.configure(text=str(value))
                 elif kind == "transfer-ask":
                     # The worker is blocked on ``_transfer_event``; answer it with
                     # the operator's choice and nothing else.  A question whose
@@ -2175,6 +2562,28 @@ class InstallerWindow:
                     self._transfer_answer = self._confirm_activation_transfer(
                         str(value)
                     )
+                    event.set()
+                elif kind == "code-ask":
+                    # The worker is blocked on ``_code_request_event``.  Two
+                    # customer steps, in this order: bind the licence to this new
+                    # folder, then take the activation code.  An empty answer is
+                    # NOT a stop: the worker waits, says 等待授权完成… and asks
+                    # again, so the install continues once the code is in place.
+                    event = self._code_request_event
+                    if event is None:
+                        continue
+                    entered = ""
+                    rebind = False
+                    try:
+                        verdict = self._confirm_rebind(bool(value))
+                        if verdict is not False:
+                            entered = self._ask_activation_code()
+                        rebind = verdict is True
+                    except Exception:  # noqa: BLE001 - never leave the worker parked
+                        logging.exception("installer: the code question failed")
+                        entered = ""
+                    self._code_request_rebind = bool(rebind and entered)
+                    self._code_request_answer = entered
                     event.set()
                 elif kind == "versions":
                     versions, installed = value
@@ -2243,6 +2652,9 @@ class InstallerWindow:
                             if first_setup
                             else f"更新完成（{version}，{changed} 个文件）。可双击安装目录里的“启动助手.bat”启动。"
                         )
+                        rebind_note = self._finish_rebind(root)
+                        if rebind_note:
+                            message = f"{message}\n\n{rebind_note}"
                         messagebox.showinfo(
                             "完成", f"{message}\n\n{authorization_note}", parent=self.root,
                         )
@@ -2254,6 +2666,61 @@ class InstallerWindow:
         except queue.Empty:
             pass
         self.root.after(50, self._drain_events)
+
+    def _confirm_rebind(self, has_other_install: bool) -> bool | None:
+        """First of the two binding steps, worded for the customer.
+
+        ``True`` = bind here, ``False`` = cancel, ``None`` = the question could not
+        be shown (the caller then still asks for the code instead of dead-ending).
+        No paths, versions or log jargon: this dialog is what a client reads.
+        """
+
+        if has_other_install:
+            body = "本机已有其他文件夹正在使用。\n\n是否将授权绑定到新的位置？"
+        else:
+            body = "这个文件夹还没有授权。\n\n是否现在绑定授权到新的位置？"
+        try:
+            return bool(messagebox.askyesno("绑定授权", body, parent=self.root))
+        except Exception:  # noqa: BLE001 - report "could not ask"
+            logging.exception("installer: binding confirmation dialog failed")
+            return None
+
+    def _finish_rebind(self, root: Path) -> str:
+        """Move the activation away from the previous folder after a success.
+
+        Only the ENTITLEMENT document moves (``auth.json`` / ``license.json``): the
+        old folder keeps its程序 and its 助手配置, so nothing is destroyed and the
+        move is reversible by renaming the file back.
+        """
+
+        source = str(getattr(self, "_rebind_from", "") or "")
+        if not source:
+            return ""
+        self._rebind_from = None
+        moved: list[str] = []
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = Path(source)
+        for folder in (base, base / "助手配置"):
+            for name in ("auth.json", "license.json"):
+                path = folder / name
+                try:
+                    if not path.is_file():
+                        continue
+                    target = path.with_name(f"{name}.rebound-{stamp}")
+                    path.replace(target)
+                    moved.append(str(target))
+                except OSError:
+                    logging.exception("installer: could not move %s", path)
+        if moved:
+            logging.info(
+                "installer: activation moved from %s (kept as %s); it now lives in %s",
+                source, ", ".join(moved), root,
+            )
+            return "授权已绑定到当前位置。"
+        logging.warning(
+            "installer: the previous folder %s held no entitlement to move", source,
+        )
+        return "授权已绑定到当前位置。"
 
     def run(self) -> None:
         self.root.mainloop()
